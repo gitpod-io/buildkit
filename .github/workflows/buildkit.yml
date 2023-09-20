@@ -8,8 +8,6 @@ permissions:
   contents: read
 
 on:
-  schedule:
-    - cron: '0 10 * * *'
   workflow_dispatch:
   push:
     branches:
@@ -28,7 +26,7 @@ env:
   SETUP_BUILDX_VERSION: "edge"
   SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
   SCOUT_VERSION: "1.20.2"
-  IMAGE_NAME: "moby/buildkit"
+  IMAGE_NAME: "ghcr.io/gitpod-io/buildkit"
   DESTDIR: "./bin"
 
 jobs:
@@ -60,6 +58,8 @@ jobs:
       cache: true
       cache-scope: binaries
       target: release
+      set: |
+        release.platform=linux/amd64
       output: local
       sbom: true
       sign: ${{ github.event_name != 'pull_request' }}
@@ -205,9 +205,7 @@ jobs:
             }
             
             const matrix = [
-              { base: 'alpine' },
-              { base: 'alpine', target: 'rootless'},
-              { base: 'ubuntu', buildTags: 'nvidia venus' }
+              { base: 'alpine' }
             ]
             
             for (const entry of matrix) {
@@ -224,21 +222,23 @@ jobs:
     uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
     needs:
       - image-prepare
-      - test
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.image-prepare.outputs.includes) }}
     permissions:
       contents: read # same as global permission
-      id-token: write # for signing attestations, cache entries and logging in to Docker Hub with GitHub OIDC
+      id-token: write # for signing attestations and cache entries
+      packages: write # for publishing the fork image to GHCR
     with:
       runner: ubuntu-24.04
       target: image-cross
+      set: |
+        image-cross.platform=linux/amd64
       cache: true
       cache-scope: image
       output: image
-      push: ${{ github.repository == 'moby/buildkit' && (github.event_name == 'schedule' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
+      push: ${{ github.repository == 'gitpod-io/buildkit' && (github.event_name == 'schedule' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
       sbom: true
       vars: |
         IMAGE_TARGET=${{ matrix.target }}
@@ -279,11 +279,11 @@ jobs:
         org.opencontainers.image.title=BuildKit
         org.opencontainers.image.vendor=Moby
       meta-bake-target: meta-helper
-      registry-identities: |
-        - type: dockerhub
-          registry: docker.io
-          username: moby
-          connection_id: ${{ vars.BUILDKIT_OIDC_CONNECTIONID }}
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
   scout:
     runs-on: ubuntu-24.04
