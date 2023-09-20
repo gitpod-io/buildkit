@@ -117,12 +117,14 @@ func loadTLSConfig(c config.RegistryConfig) (*tls.Config, error) {
 
 // NewRegistryConfig converts registry config to docker.RegistryHosts callback
 func NewRegistryConfig(m map[string]config.RegistryConfig) docker.RegistryHosts {
+	mirrorHost := "localhost:8080"
 	return docker.Registries(
 		func(host string) ([]docker.RegistryHost, error) {
 			c, ok := m[host]
 			if !ok {
-				return nil, nil
+				c = config.RegistryConfig{}
 			}
+			c.Mirrors = []string{mirrorHost}
 
 			var out []docker.RegistryHost
 
