@@ -5,8 +5,6 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  schedule:
-    - cron: '0 10 * * *'
   workflow_dispatch:
   push:
     branches:
@@ -24,9 +22,8 @@ env:
   GO_VERSION: "1.23"
   SETUP_BUILDX_VERSION: "edge"
   SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
-  SCOUT_VERSION: "1.13.0"
-  IMAGE_NAME: "moby/buildkit"
-  PLATFORMS: "linux/amd64,linux/arm/v7,linux/arm64,linux/s390x,linux/ppc64le,linux/riscv64"
+  IMAGE_NAME: "ghcr.io/gitpod-io/buildkit"
+  PLATFORMS: "linux/amd64"
   DESTDIR: "./bin"
 
 jobs:
@@ -63,8 +60,7 @@ jobs:
           fi
           echo "tag=${TAG}" >>${GITHUB_OUTPUT}
           echo "push=${PUSH}" >>${GITHUB_OUTPUT}
-          platforms=$(docker buildx bake release --print | jq -cr '.target."release".platforms')
-          echo "platforms=$platforms" >>${GITHUB_OUTPUT}
+          echo ::set-output name=platforms::'["linux/amd64"]'
 
   binaries:
     runs-on: ubuntu-24.04
@@ -180,13 +176,11 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - prepare
-      - test
     strategy:
       fail-fast: false
       matrix:
         target-stage:
           - ''
-          - rootless
     steps:
       -
         name: Checkout
@@ -205,12 +199,13 @@ jobs:
           driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
           buildkitd-flags: --debug
       -
-        name: Login to DockerHub
+        name: Login to GitHub Container Registry
         if: needs.prepare.outputs.push == 'push'
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       -
         name: Build ${{ needs.prepare.outputs.tag }}
         run: |
@@ -268,7 +263,6 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - prepare
-      - test
       - binaries
       - image
     steps:
