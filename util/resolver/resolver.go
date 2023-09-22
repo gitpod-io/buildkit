@@ -125,6 +125,9 @@ func NewRegistryConfig(m map[string]config.RegistryConfig) docker.RegistryHosts 
 	mirrorHost := "localhost:8080"
 	return docker.Registries(
 		func(host string) ([]docker.RegistryHost, error) {
+			if ok, _ := docker.MatchLocalhost(host); ok {
+				return nil, nil
+			}
 			c, ok := m[host]
 			if !ok {
 				c = config.RegistryConfig{}
