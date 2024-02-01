@@ -137,12 +137,14 @@ func (b *provenanceBridge) ResolveImageConfig(ctx context.Context, ref string, o
 		return "", "", nil, err
 	}
 
+	b.mu.Lock()
 	b.images = append(b.images, provenance.ImageSource{
 		Ref:      ref,
 		Platform: opt.Platform,
 		Digest:   dgst,
 		Local:    opt.ResolverType == llb.ResolverTypeOCILayout,
 	})
+	b.mu.Unlock()
 	return ref, dgst, config, nil
 }
 
@@ -163,7 +165,7 @@ func (b *provenanceBridge) Solve(ctx context.Context, req frontend.SolveRequest,
 			return nil, errors.Errorf("invalid frontend: %s", req.Frontend)
 		}
 		wb := &provenanceBridge{llbBridge: b.llbBridge, req: &req}
-		res, err = f.Solve(ctx, wb, req.FrontendOpt, req.FrontendInputs, sid, b.llbBridge.sm)
+		res, err = f.Solve(ctx, wb, b.llbBridge, req.FrontendOpt, req.FrontendInputs, sid, b.llbBridge.sm)
 		if err != nil {
 			return nil, err
 		}

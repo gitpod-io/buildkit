@@ -677,8 +677,8 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		return nil, err
 	}
 	frontends := map[string]frontend.Frontend{}
-	frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc, dockerfile.Build)
-	frontends["gateway.v0"] = gateway.NewGatewayFrontend(wc)
+	frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc.Infos(), dockerfile.Build)
+	frontends["gateway.v0"] = gateway.NewGatewayFrontend(wc.Infos())
 
 	cacheStorage, err := bboltcachestorage.NewStore(filepath.Join(cfg.Root, "cache.db"))
 	if err != nil {
@@ -722,6 +722,7 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		Entitlements:              cfg.Entitlements,
 		TraceCollector:            tc,
 		HistoryDB:                 historyDB,
+		CacheStore:                cacheStorage,
 		LeaseManager:              w.LeaseManager(),
 		ContentStore:              w.ContentStore(),
 		HistoryConfig:             cfg.History,
