@@ -55,7 +55,7 @@ jobs:
               PUSH=push
             fi
           fi
-          if [ "$GITHUB_REPOSITORY" != "moby/buildkit" ]; then
+          if [ "$GITHUB_REPOSITORY" != "gitpod-io/buildkit" ]; then
             PUSH=false
           fi
           echo "tag=${TAG}" >>${GITHUB_OUTPUT}
