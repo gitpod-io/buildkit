@@ -7,7 +7,9 @@ ARG CONTAINERD_ALT_VERSION_17=v1.7.25
 ARG CONTAINERD_ALT_VERSION_16=v1.6.36
 ARG REGISTRY_VERSION=v2.8.3
 ARG ROOTLESSKIT_VERSION=v2.3.2
-ARG CNI_VERSION=v1.5.1
+ARG CNI_VERSION=v1.9.1
+ARG CNI_X_NET_VERSION=v0.55.0
+ARG RUNC_X_NET_VERSION=v0.55.0
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.15.1
 ARG NERDCTL_VERSION=v1.6.2
 ARG DNSNAME_VERSION=v1.3.1
@@ -44,6 +46,8 @@ FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
 ARG RUNC_VERSION
 ADD --keep-git-dir=true "https://github.com/opencontainers/runc.git#$RUNC_VERSION" .
+ARG RUNC_X_NET_VERSION
+RUN go get "golang.org/x/net@${RUNC_X_NET_VERSION}" && go mod tidy && go mod vendor
 ARG TARGETPLATFORM
 # gcc is only installed for libgcc
 # lld has issues building static binaries for ppc so prefer ld for it
@@ -140,16 +144,24 @@ RUN --mount=target=/root/.cache,type=cache \
     CGO_ENABLED=0 xx-go build -o /usr/bin/dnsname ./plugins/meta/dnsname && \
     xx-verify --static /usr/bin/dnsname
 
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS cni-plugins
-RUN apk add --no-cache curl
-COPY --from=xx / /
+FROM gobuild-base AS cni-plugins
+WORKDIR $GOPATH/src/github.com/containernetworking/plugins
 ARG CNI_VERSION
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETPLATFORM
+ARG CNI_X_NET_VERSION
+ADD --keep-git-dir=true "https://github.com/containernetworking/plugins.git#$CNI_VERSION" .
+RUN go get "golang.org/x/net@${CNI_X_NET_VERSION}" && go mod tidy && go mod vendor
 WORKDIR /opt/cni/bin
-RUN curl -Ls https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz | tar xzv
-RUN xx-verify --static bridge loopback host-local
+ARG TARGETPLATFORM
+RUN --mount=target=/root/.cache,type=cache <<EOT
+  set -ex
+  cd /go/src/github.com/containernetworking/plugins
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/bridge ./plugins/main/bridge
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/loopback ./plugins/main/loopback
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/host-local ./plugins/ipam/host-local
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/firewall ./plugins/meta/firewall
+  cd /opt/cni/bin
+  xx-verify --static bridge loopback host-local firewall
+EOT
 COPY --link --from=dnsname /usr/bin/dnsname /opt/cni/bin/
 
 FROM scratch AS cni-plugins-export
@@ -374,6 +386,7 @@ EOT
 
 FROM buildkit-export AS buildkit-linux
 COPY --link --from=binaries / /usr/bin/
+COPY --link .vex /usr/share/buildkit/vex
 ENV BUILDKIT_SETUP_CGROUPV2_ROOT=1
 ENTRYPOINT ["buildkitd"]
 
