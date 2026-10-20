@@ -1,0 +1,25 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/gitpod-io/buildkit/security/vex/v0.20.1-gitpod.8",
+  "author": "Gitpod",
+  "timestamp": "2026-06-08T00:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "GO-2026-4858",
+        "aliases": [
+          "GHSA-4c29-8rgm-jvjj"
+        ]
+      },
+      "timestamp": "2026-06-08T00:00:00Z",
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/moby/buildkit@v0.20.1-gitpod.8"
+        }
+      ],
+      "status": "fixed",
+      "action_statement": "Fixed by backporting upstream BuildKit git subdir normalization and checkout validation from 45b038cd0b2ec2d34013ce0f085522276f7ee0d8."
+    }
+  ]
+}

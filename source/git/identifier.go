@@ -1,8 +1,6 @@
 package git
 
 import (
-	"path"
-
 	"github.com/moby/buildkit/solver/llbsolver/provenance"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/source"
@@ -34,9 +32,6 @@ func NewGitIdentifier(remoteURL string) (*GitIdentifier, error) {
 	if u.Fragment != nil {
 		repo.Ref = u.Fragment.Ref
 		repo.Subdir = u.Fragment.Subdir
-	}
-	if sd := path.Clean(repo.Subdir); sd == "/" || sd == "." {
-		repo.Subdir = ""
 	}
 	return &repo, nil
 }

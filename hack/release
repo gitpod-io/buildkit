@@ -75,4 +75,7 @@ done
 
 mkdir -p "$DESTDIR"
 mv "$output"/**/* "$DESTDIR/"
+if compgen -G ".vex/*.openvex.json" >/dev/null; then
+  cp .vex/*.openvex.json "$DESTDIR/"
+fi
 rm -rf "$output"
