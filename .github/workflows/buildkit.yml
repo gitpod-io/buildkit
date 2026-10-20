@@ -8,8 +8,6 @@ permissions:
   contents: read
 
 on:
-  schedule:
-    - cron: '0 10 * * *'
   workflow_dispatch:
   push:
     branches:
