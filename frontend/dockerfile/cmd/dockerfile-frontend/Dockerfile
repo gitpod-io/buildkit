@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG GO_VERSION=1.26.2
+ARG GO_VERSION=1.26.9
 ARG ALPINE_VERSION=3.23
 ARG XX_VERSION=1.6.1
 
