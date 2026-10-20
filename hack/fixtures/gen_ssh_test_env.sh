@@ -71,8 +71,10 @@ done
 # Sign manually without -U
 ssh-keygen -Y sign -f "$base/.ssh/__USER__.id_ed25519" -n git "$buf" >/dev/null
 
-# ssh-keygen wrote "$buf.sig"; rename to what Git expects
-mv "$buf.sig" "$out"
+# ssh-keygen normally writes the path Git expects already.
+if [ "$buf.sig" != "$out" ]; then
+    mv "$buf.sig" "$out"
+fi
 EOF
 
 # inject username into wrapper
