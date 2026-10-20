@@ -1,6 +1,6 @@
 module github.com/moby/buildkit
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.1
@@ -50,7 +50,7 @@ require (
 	github.com/in-toto/in-toto-golang v0.11.0
 	github.com/klauspost/compress v1.20.1
 	github.com/moby/docker-image-spec v1.3.1
-	github.com/moby/go-archive v0.2.0
+	github.com/moby/go-archive v0.3.0
 	github.com/moby/locker v1.0.1
 	github.com/moby/patternmatcher v0.6.1
 	github.com/moby/policy-helpers v0.0.0-20261006174519-bd98f4747414
@@ -107,7 +107,7 @@ require (
 	golang.org/x/crypto v0.57.0
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b
 	golang.org/x/mod v0.41.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/time v0.16.0

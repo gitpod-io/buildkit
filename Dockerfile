@@ -24,7 +24,7 @@ ARG EXPORT_BASE=alpine
 ARG ALPINE_VERSION=3.23
 ARG UBUNTU_VERSION=24.04
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.9
 ARG XX_VERSION=1.9.0
 ARG BUILDKIT_DEBUG
 
@@ -51,6 +51,8 @@ FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
 ARG RUNC_VERSION
 ADD --keep-git-dir=true "https://github.com/opencontainers/runc.git#$RUNC_VERSION" .
+RUN go get golang.org/x/net@v0.60.0 github.com/moby/sys/user@v0.4.1 github.com/cilium/ebpf@v0.22.0 \
+  && go mod tidy && go mod vendor
 ARG TARGETPLATFORM
 # gcc is only installed for libgcc
 # lld has issues building static binaries for ppc so prefer ld for it
@@ -157,16 +159,27 @@ RUN --mount=target=/root/.cache,type=cache \
     CGO_ENABLED=0 xx-go build -o /usr/bin/dnsname ./plugins/meta/dnsname && \
     xx-verify --static /usr/bin/dnsname
 
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS cni-plugins
-RUN apk add --no-cache curl
-COPY --from=xx / /
+FROM gobuild-base AS cni-plugins
+WORKDIR /go/src/github.com/containernetworking/plugins
 ARG CNI_VERSION
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETPLATFORM
+ADD --keep-git-dir=true "https://github.com/containernetworking/plugins.git#$CNI_VERSION" .
+RUN go get golang.org/x/net@v0.60.0 golang.org/x/sys@v0.48.0 \
+    github.com/buger/jsonparser@v1.1.2 \
+    github.com/insomniacslk/dhcp@v0.0.0-20260719225207-c76316d4aa82 \
+    google.golang.org/grpc@v1.84.0 \
+  && go mod tidy && go mod vendor
 WORKDIR /opt/cni/bin
-RUN curl -fsSL https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz | tar xzv
-RUN xx-verify --static bridge loopback host-local
+ARG TARGETPLATFORM
+RUN --mount=target=/root/.cache,type=cache <<EOT
+  set -ex
+  cd /go/src/github.com/containernetworking/plugins
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/bridge ./plugins/main/bridge
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/loopback ./plugins/main/loopback
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/host-local ./plugins/ipam/host-local
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/firewall ./plugins/meta/firewall
+  cd /opt/cni/bin
+  xx-verify --static bridge loopback host-local firewall
+EOT
 COPY --link --from=dnsname /usr/bin/dnsname /opt/cni/bin/
 
 FROM scratch AS cni-plugins-export
