@@ -8,12 +8,9 @@ permissions:
   contents: read
 
 on:
+  # Historical upstream daemons are outside the Gitpod fork's supported scope.
+  # Keep this matrix available for an explicit investigation.
   workflow_dispatch:
-  pull_request:
-  push:
-    branches:
-      - 'master'
-      - 'v[0-9]+.[0-9]+'
 
 env:
   SETUP_BUILDX_VERSION: "edge"
@@ -59,19 +56,21 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Build integration-tests-base
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: ./.github/actions/retry-go-network
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
-          targets: integration-tests-base
-          set: |
-            *.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}
-            *.cache-to=type=gha,scope=${{ env.CACHE_SCOPE }},repository=${{ github.repository }},ghtoken=${{ github.token }}
+          command: |
+            docker buildx bake --progress=plain integration-tests-base \
+              --set '*.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}' \
+              --set "*.cache-to=type=gha,scope=${{ env.CACHE_SCOPE }},repository=${GITHUB_REPOSITORY},ghtoken=${GITHUB_TOKEN}"
       -
         name: Build test image
-        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        uses: ./.github/actions/retry-go-network
         with:
-          targets: integration-tests
-          set: |
-            *.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}
+          command: |
+            docker buildx bake --progress=plain integration-tests \
+              --set '*.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}'
       -
         name: Test compatibility releases
         env:

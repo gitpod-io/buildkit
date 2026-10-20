@@ -1,0 +1,21 @@
+name: Retry transient Go downloads
+description: Run a command again when a Go proxy download fails transiently, retaining Docker's build cache.
+inputs:
+  command:
+    description: Command to execute, including a Docker build that downloads Go modules.
+    required: true
+  attempts:
+    description: Maximum number of attempts, including the first execution.
+    default: "3"
+  delay:
+    description: Seconds to wait between attempts.
+    default: "10"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RETRY_COMMAND: ${{ inputs.command }}
+        RETRY_ATTEMPTS: ${{ inputs.attempts }}
+        RETRY_DELAY: ${{ inputs.delay }}
+      run: bash "$GITHUB_ACTION_PATH/retry.sh"
