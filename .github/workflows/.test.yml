@@ -110,9 +110,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Gitpod runs OCI/runc inside workspacekit's user namespace with host networking.
         worker:
+          - containerd
+          - containerd-rootless
+          - containerd-1.7
+          - containerd-2.3
+          - containerd-snapshotter-stargz
+          - oci
           - oci-rootless
+          - oci-rootless-gvisor-tap-vsock-detachnetns
+          - oci-snapshotter-stargz
         pkg: ${{ fromJson(needs.prepare.outputs.pkgs) }}
         kind: ${{ fromJson(needs.prepare.outputs.kinds) }}
         tags: ${{ fromJson(needs.prepare.outputs.tags) }}
