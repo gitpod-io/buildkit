@@ -2,7 +2,6 @@ package dockerfile2llb
 
 import (
 	"bytes"
-	"context"
 	"maps"
 	"testing"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	"github.com/moby/buildkit/frontend/dockerui"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/appcontext"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	digest "github.com/opencontainers/go-digest"
@@ -110,8 +110,47 @@ RUN ls -l
 	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
 
-	_, err = res.State.Marshal(context.TODO())
+	_, err = res.State.Marshal(t.Context())
 	require.NoError(t, err)
+}
+
+func TestRunCustomNameKeepsEscapes(t *testing.T) {
+	t.Parallel()
+	df := `FROM scratch
+ENV FOO=bar
+RUN echo C:\hello\world\path
+RUN echo "C:\hello\quoted\path"
+RUN echo \$FOO $FOO "a\"b"
+RUN ["echo", "C:\\exec\\path"]
+`
+	assert.ElementsMatch(t, []string{
+		`[1/4] RUN echo C:\hello\world\path`,
+		`[2/4] RUN echo "C:\hello\quoted\path"`,
+		`[3/4] RUN echo \$FOO bar "a\"b"`,
+		`[4/4] RUN ["echo", "C:\\exec\\path"]`,
+	}, customNames(t, df))
+
+	df = "# escape=`\nFROM scratch\nENV FOO=bar\nRUN echo C:\\hello `$FOO $FOO\n"
+	assert.ElementsMatch(t, []string{
+		"[1/1] RUN echo C:\\hello `$FOO bar",
+	}, customNames(t, df))
+}
+
+func customNames(t *testing.T, df string) []string {
+	t.Helper()
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	require.NoError(t, err)
+
+	def, err := res.State.Marshal(t.Context())
+	require.NoError(t, err)
+
+	var names []string
+	for _, md := range def.Metadata {
+		if name, ok := md.Description["llb.customname"]; ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func TestCopyFromKeepsStageLabels(t *testing.T) {
@@ -304,18 +343,18 @@ func TestResolveSourceDateEpochValue(t *testing.T) {
 	globalArgs := &llb.EnvList{}
 	shlex := shell.NewLex('\\')
 
-	tm, err := resolveSourceDateEpochValue(context.Background(), "1700000501", ConvertOpt{}, nil, globalArgs, shlex)
+	tm, err := resolveSourceDateEpochValue(t.Context(), "1700000501", ConvertOpt{}, nil, globalArgs, shlex)
 	require.NoError(t, err)
 	require.NotNil(t, tm)
 	assert.Equal(t, time.Unix(1700000501, 0).UTC(), *tm)
 	assert.Equal(t, "1700000501", formatSourceDateEpochValue(tm))
 
-	tm, err = resolveSourceDateEpochValue(context.Background(), "context", ConvertOpt{}, nil, globalArgs, shlex)
+	tm, err = resolveSourceDateEpochValue(t.Context(), "context", ConvertOpt{}, nil, globalArgs, shlex)
 	require.NoError(t, err)
 	assert.Nil(t, tm)
 	assert.Empty(t, formatSourceDateEpochValue(tm))
 
-	_, err = resolveSourceDateEpochValue(context.Background(), "not-a-timestamp", ConvertOpt{}, nil, globalArgs, shlex)
+	_, err = resolveSourceDateEpochValue(t.Context(), "not-a-timestamp", ConvertOpt{}, nil, globalArgs, shlex)
 	require.ErrorContains(t, err, "invalid SOURCE_DATE_EPOCH")
 }
 
@@ -336,7 +375,7 @@ FROM scratch
 	require.NoError(t, err)
 
 	globalArgs := (&llb.EnvList{}).AddOrReplace("SOURCE_DATE_EPOCH", "mysource")
-	_, err = resolveSourceDateEpochValue(context.Background(), "mysource", ConvertOpt{}, stages, globalArgs, shell.NewLex('\\'))
+	_, err = resolveSourceDateEpochValue(t.Context(), "mysource", ConvertOpt{}, stages, globalArgs, shell.NewLex('\\'))
 	require.ErrorContains(t, err, "SOURCE_DATE_EPOCH stage does not meet source-only requirements")
 }
 
@@ -356,13 +395,58 @@ ADD $URL /
 	require.NoError(t, err)
 	require.Len(t, stages, 1)
 
-	state, err := sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'))
+	state, err := sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'), false)
 	require.NoError(t, err)
 	require.NotNil(t, state)
-	sourceOp, err := sourceOpFromState(context.Background(), state)
+	sourceOp, err := sourceOpFromState(t.Context(), state)
 	require.NoError(t, err)
 	require.NotNil(t, sourceOp)
 	assert.Equal(t, "src.tar", sourceOp.Attrs["http.filename"])
+}
+
+func TestDockerfileGitAdviceBuildArgADD(t *testing.T) {
+	t.Parallel()
+
+	df := []byte(`
+FROM scratch
+ADD https://github.com/moby/buildkit.git#master /
+`)
+
+	for _, tc := range []struct {
+		name      string
+		gitAdvice bool
+		wantAttr  bool
+	}{
+		{
+			name: "default",
+		},
+		{
+			name:      "enabled",
+			gitAdvice: true,
+			wantAttr:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, err := Dockerfile2LLB(appcontext.Context(), df, ConvertOpt{
+				Config: dockerui.Config{
+					GitAdvice: tc.gitAdvice,
+				},
+			})
+			require.NoError(t, err)
+
+			sourceOp, err := sourceOpFromState(t.Context(), &res.State)
+			require.NoError(t, err)
+			require.NotNil(t, sourceOp)
+
+			if tc.wantAttr {
+				require.Equal(t, "true", sourceOp.Attrs[pb.AttrGitAdvice])
+			} else {
+				require.NotContains(t, sourceOp.Attrs, pb.AttrGitAdvice)
+			}
+		})
+	}
 }
 
 func TestSourceDateEpochStageSourceRequiresScratch(t *testing.T) {
@@ -380,7 +464,7 @@ ADD https://example.com/src.tar /
 	require.NoError(t, err)
 	require.Len(t, stages, 1)
 
-	_, err = sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'))
+	_, err = sourceDateEpochStageSource(stages[0], nil, &llb.EnvList{}, shell.NewLex('\\'), false)
 	require.ErrorContains(t, err, "SOURCE_DATE_EPOCH stage must use FROM scratch")
 }
 
@@ -389,7 +473,7 @@ func TestSourceOpFromStateWrappedCopy(t *testing.T) {
 
 	st := llb.Scratch().File(llb.Copy(llb.HTTP("https://example.com/src.tar"), "src.tar", "/foo"))
 
-	sourceOp, err := sourceOpFromState(context.Background(), &st)
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
 	require.NoError(t, err)
 	require.NotNil(t, sourceOp)
 	assert.Equal(t, "https://example.com/src.tar", sourceOp.Identifier)
@@ -402,7 +486,7 @@ func TestSourceOpFromStateMultipleSourcesIgnored(t *testing.T) {
 		File(llb.Copy(llb.HTTP("https://example.com/src1.tar"), "src1.tar", "/foo")).
 		File(llb.Copy(llb.HTTP("https://example.com/src2.tar"), "src2.tar", "/bar"))
 
-	sourceOp, err := sourceOpFromState(context.Background(), &st)
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
 	require.NoError(t, err)
 	assert.Nil(t, sourceOp)
 }
@@ -412,14 +496,52 @@ func TestSourceStateFromSourceOpWrappedCopy(t *testing.T) {
 
 	st := llb.Scratch().File(llb.Copy(llb.HTTP("https://example.com/src.tar", llb.Filename("src.tar")), "src.tar", "/foo"))
 
-	sourceOp, err := sourceOpFromState(context.Background(), &st)
+	sourceOp, err := sourceOpFromState(t.Context(), &st)
 	require.NoError(t, err)
 	require.NotNil(t, sourceOp)
 
 	sourceState := llb.NewState(llb.NewSource(sourceOp.Identifier, maps.Clone(sourceOp.Attrs), llb.Constraints{}).Output())
-	rewrittenSourceOp, err := sourceOpFromState(context.Background(), &sourceState)
+	rewrittenSourceOp, err := sourceOpFromState(t.Context(), &sourceState)
 	require.NoError(t, err)
 	require.NotNil(t, rewrittenSourceOp)
 	assert.Equal(t, sourceOp.Identifier, rewrittenSourceOp.Identifier)
 	assert.Equal(t, sourceOp.Attrs, rewrittenSourceOp.Attrs)
+}
+
+func TestCopyLinkChownByName(t *testing.T) {
+	t.Parallel()
+
+	caps := pb.Caps.CapSet(pb.Caps.All())
+
+	for _, tc := range []struct {
+		name    string
+		flags   string
+		mergeOp bool
+		err     string
+	}{
+		{name: "numeric", flags: "--link --chown=1000:1000", mergeOp: true},
+		{name: "root", flags: "--link --chown=root:root", mergeOp: true},
+		{name: "user name", flags: "--link --chown=foo", mergeOp: true, err: "--chown=foo"},
+		{name: "user and group names", flags: "--link --chown=foo:bar", mergeOp: true, err: "--chown=foo:bar"},
+		{name: "group name", flags: "--link --chown=1000:bar", mergeOp: true, err: "--chown=1000:bar"},
+		{name: "user name without merge op", flags: "--link --chown=foo:bar", err: "--chown=foo:bar"},
+		{name: "user name with chmod", flags: "--link --chmod=644 --chown=foo:bar", mergeOp: true, err: "--chown=foo:bar"},
+		{name: "user name without link", flags: "--chown=foo:bar", mergeOp: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			df := "FROM scratch\nCOPY " + tc.flags + " a /b\n"
+			opt := ConvertOpt{}
+			if tc.mergeOp {
+				opt.LLBCaps = &caps
+			}
+			_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), opt)
+			if tc.err == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.err)
+			require.ErrorContains(t, err, "--link")
+		})
+	}
 }

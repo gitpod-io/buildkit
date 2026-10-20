@@ -833,10 +833,12 @@ func (dctx *dispatchContext) dispatchStages(ctx context.Context, allReachable ma
 			buildPlatforms:      dctx.platformOpt.buildPlatforms,
 			targetPlatform:      dctx.platformOpt.targetPlatform,
 			extraHosts:          dctx.opt.ExtraHosts,
+			gitAdvice:           dctx.opt.GitAdvice,
 			shmSize:             dctx.opt.ShmSize,
 			ulimit:              dctx.opt.Ulimits,
 			devices:             dctx.opt.Devices,
 			cgroupParent:        dctx.opt.CgroupParent,
+			linuxResources:      dctx.opt.LinuxResources,
 			llbCaps:             dctx.opt.LLBCaps,
 			sourceMap:           dctx.opt.SourceMap,
 			lint:                dctx.lint,
@@ -988,10 +990,12 @@ type dispatchOpt struct {
 	targetPlatform      ocispecs.Platform
 	buildPlatforms      []ocispecs.Platform
 	extraHosts          []llb.HostIP
+	gitAdvice           bool
 	shmSize             int64
 	ulimit              []*pb.Ulimit
 	devices             []*pb.CDIDevice
 	cgroupParent        string
+	linuxResources      *pb.LinuxResources
 	llbCaps             *apicaps.CapSet
 	sourceMap           *llb.SourceMap
 	lint                *linter.Linter
@@ -1461,6 +1465,7 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 
 	shlex := *dopt.shlex
 	shlex.RawQuotes = true
+	shlex.RawEscapes = true
 	shlex.SkipUnsetEnv = true
 
 	pl, err := d.state.GetPlatform(context.TODO())
@@ -1482,6 +1487,20 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 	if dopt.llbCaps != nil && dopt.llbCaps.Supports(pb.CapExecMetaCgroupParent) == nil {
 		if len(dopt.cgroupParent) > 0 {
 			opt = append(opt, llb.WithCgroupParent(dopt.cgroupParent))
+		}
+	}
+
+	if dopt.llbCaps != nil && dopt.llbCaps.Supports(pb.CapExecMetaLinuxResources) == nil {
+		if dopt.linuxResources != nil {
+			opt = append(opt, llb.WithLinuxResources(llb.LinuxResources{
+				Memory:     dopt.linuxResources.Memory,
+				MemorySwap: dopt.linuxResources.MemorySwap,
+				CPUShares:  dopt.linuxResources.CpuShares,
+				CPUPeriod:  dopt.linuxResources.CpuPeriod,
+				CPUQuota:   dopt.linuxResources.CpuQuota,
+				CpusetCpus: dopt.linuxResources.CpusetCpus,
+				CpusetMems: dopt.linuxResources.CpusetMems,
+			}))
 		}
 	}
 

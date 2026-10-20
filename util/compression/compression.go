@@ -1,7 +1,6 @@
 package compression
 
 import (
-	"bytes"
 	"context"
 	"io"
 
@@ -9,6 +8,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	cdcompression "github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/stargz-snapshotter/estargz"
+	"github.com/moby/buildkit/util/archiveutil"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/iohelper"
 	digest "github.com/opencontainers/go-digest"
@@ -74,10 +74,6 @@ func (c Config) SetLevel(l int) Config {
 	c.Level = &l
 	return c
 }
-
-const (
-	mediaTypeDockerSchema2LayerZstd = images.MediaTypeDockerSchema2Layer + ".zstd"
-)
 
 var Default = Gzip
 
@@ -167,16 +163,12 @@ func detectCompressionType(cr *io.SectionReader) (Type, error) {
 		return EStargz, nil
 	}
 
-	for c, m := range map[Type][]byte{
-		Gzip: {0x1F, 0x8B, 0x08},
-		Zstd: {0x28, 0xB5, 0x2F, 0xFD},
-	} {
-		if n < len(m) {
-			continue
-		}
-		if bytes.Equal(m, buf[:len(m)]) {
-			return c, nil
-		}
+	header := buf[:n]
+	switch {
+	case archiveutil.HasGzipPrefix(header):
+		return Gzip, nil
+	case archiveutil.HasZstdPrefix(header):
+		return Zstd, nil
 	}
 
 	return Uncompressed, nil
@@ -191,8 +183,8 @@ var toDockerLayerType = map[string]string{
 	images.MediaTypeDockerSchema2LayerForeignGzip:    images.MediaTypeDockerSchema2LayerForeignGzip,
 	ocispecs.MediaTypeImageLayerNonDistributable:     images.MediaTypeDockerSchema2LayerForeign,     //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 	ocispecs.MediaTypeImageLayerNonDistributableGzip: images.MediaTypeDockerSchema2LayerForeignGzip, //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
-	ocispecs.MediaTypeImageLayerZstd:                 mediaTypeDockerSchema2LayerZstd,
-	mediaTypeDockerSchema2LayerZstd:                  mediaTypeDockerSchema2LayerZstd,
+	ocispecs.MediaTypeImageLayerZstd:                 images.MediaTypeDockerSchema2LayerZstd,
+	images.MediaTypeDockerSchema2LayerZstd:           images.MediaTypeDockerSchema2LayerZstd,
 }
 
 var toOCILayerType = map[string]string{
@@ -206,7 +198,7 @@ var toOCILayerType = map[string]string{
 	images.MediaTypeDockerSchema2LayerForeign:        ocispecs.MediaTypeImageLayerNonDistributable,     //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 	images.MediaTypeDockerSchema2LayerForeignGzip:    ocispecs.MediaTypeImageLayerNonDistributableGzip, //nolint:staticcheck // ignore SA1019: Non-distributable layers are deprecated, and not recommended for future use.
 	ocispecs.MediaTypeImageLayerZstd:                 ocispecs.MediaTypeImageLayerZstd,
-	mediaTypeDockerSchema2LayerZstd:                  ocispecs.MediaTypeImageLayerZstd,
+	images.MediaTypeDockerSchema2LayerZstd:           ocispecs.MediaTypeImageLayerZstd,
 }
 
 func convertLayerMediaType(ctx context.Context, mediaType string, oci bool) string {

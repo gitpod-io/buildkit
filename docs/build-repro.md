@@ -80,3 +80,49 @@ See [v0.12 documentation](https://github.com/moby/buildkit/blob/v0.12/docs/build
 in BuildKit v0.12 and v0.11.
 
 See also the [documentation](/frontend/dockerfile/docs/reference.md#buildkit-built-in-build-args) of the Dockerfile frontend.
+
+## `compatibility-version`
+
+`compatibility-version` pins digest-affecting image assembly behavior for the `image` and `oci` exporters.
+
+BuildKit currently supports these values:
+
+- `10` for the `v0.13.0` and `v0.14.0` historical path
+- `20` for the `v0.15.0` through `v0.31.x` path
+- `30` for the current path
+
+### `30`
+
+`30` is the current compatibility version.
+
+Compared to `20`, `30` changes the default image exporter media type behavior:
+
+- when `oci-mediatypes` is not set, image exports default to OCI media types
+
+### `20`
+
+`20` represents the historical `v0.15.0` through `v0.31.x` path.
+
+It matches the `v0.15.0` through `v0.31.x` output covered by the compatibility test matrix in `client/compatibility_test.go`.
+
+Compared to `30`, image exports that do not set `oci-mediatypes` keep the historical `20` media type behavior. Image exports without attestations default to Docker media types. Image exports with attestations use OCI media types because attestations require them.
+
+### `10`
+
+`10` represents the `v0.13.0` and `v0.14.0` historical path.
+
+Compared to `20`, `10` differs in two ways:
+
+- in the git-backed copied-content layer, non-executable regular files from the `git` source are stored as mode `0666` instead of `0644`
+- `compression=zstd` produces different historical artifacts
+
+The git-backed layer boundary was introduced by commit `6493fd064ceece1d29f3e61aa73a531502f4795c` ("git: ensure exec option is propagated to child git clis").
+
+The old pre-`v0.15.0` zstd artifacts crossed two independent historical changes:
+
+1. `a2a440feb58388e6873082900a5c0b35746b18f3` ("vendor: update klauspost/compress to v1.17.9")
+2. `6493fd064ceece1d29f3e61aa73a531502f4795c` ("git: ensure exec option is propagated to child git clis")
+
+The first changed zstd-compressed layer bytes. The second changed the git-backed copied-content layer metadata described above.
+
+Because the currently supported historical backfill for `10` only covers the git-backed artifact difference, BuildKit currently rejects `compression=zstd` with `compatibility-version=10` instead of claiming full reproduction of the old zstd output.

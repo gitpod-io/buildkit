@@ -1,7 +1,6 @@
 package llb
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -69,12 +68,81 @@ func TestGit(t *testing.T) {
 				"git.fullurl":          "https://github.com/foo/bar.git",
 			},
 		},
+		{
+			name:       "git advice",
+			st:         Git("github.com/foo/bar.git", "ref", GitAdvice(true)),
+			identifier: "git://github.com/foo/bar.git#ref",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+				"git.advice":           "true",
+			},
+		},
+		{
+			name:       "git advice disabled",
+			st:         Git("github.com/foo/bar.git", "ref", GitAdvice(false)),
+			identifier: "git://github.com/foo/bar.git#ref",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+			},
+		},
+		{
+			name: "bundle",
+			st: Git(
+				"github.com/foo/bar.git", "",
+				GitChecksum("1111111111111111111111111111111111111111"),
+				GitBundleURL("docker-image+blob://example.com/repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+			),
+			identifier: "git://github.com/foo/bar.git",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+				"git.checksum":         "1111111111111111111111111111111111111111",
+				"git.bundle":           "docker-image+blob://example.com/repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+		},
+		{
+			name: "bundle oci store",
+			st: Git(
+				"github.com/foo/bar.git", "",
+				GitChecksum("1111111111111111111111111111111111111111"),
+				GitBundleURL(
+					"oci-layout+blob://notreal/repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					GitBundleOCIStore("sess1", "store1"),
+				),
+			),
+			identifier: "git://github.com/foo/bar.git",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+				"git.checksum":         "1111111111111111111111111111111111111111",
+				"git.bundle":           "oci-layout+blob://notreal/repo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"oci.session":          "sess1",
+				"oci.store":            "store1",
+			},
+		},
+		{
+			name:       "checkout bundle",
+			st:         Git("github.com/foo/bar.git", "", GitCheckoutBundle()),
+			identifier: "git://github.com/foo/bar.git",
+			attrs: map[string]string{
+				"git.authheadersecret": "GIT_AUTH_HEADER",
+				"git.authtokensecret":  "GIT_AUTH_TOKEN",
+				"git.fullurl":          "https://github.com/foo/bar.git",
+				"git.checkoutbundle":   "true",
+			},
+		},
 	}
 
 	for _, tc := range tcases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := tc.st
-			def, err := st.Marshal(context.TODO())
+			def, err := st.Marshal(t.Context())
 
 			require.NoError(t, err)
 

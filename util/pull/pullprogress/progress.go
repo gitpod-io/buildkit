@@ -31,9 +31,9 @@ func (p *ProviderWithProgress) ReaderAt(ctx context.Context, desc ocispecs.Descr
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancelCause(ctx)
+	progressCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	doneCh := make(chan struct{})
-	go trackProgress(ctx, desc, p.Manager, doneCh)
+	go trackProgress(progressCtx, desc, p.Manager, doneCh) // Progress tracking is tied to the reader lifetime and canceled by Close.
 	return readerAtWithCancel{ReaderAt: ra, cancel: cancel, doneCh: doneCh, logger: bklog.G(ctx)}, nil
 }
 
@@ -65,9 +65,9 @@ func (f *FetcherWithProgress) Fetch(ctx context.Context, desc ocispecs.Descripto
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancelCause(ctx)
+	progressCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
 	doneCh := make(chan struct{})
-	go trackProgress(ctx, desc, f.Manager, doneCh)
+	go trackProgress(progressCtx, desc, f.Manager, doneCh) // Progress tracking is tied to the reader lifetime and canceled by Close.
 	return readerWithCancel{ReadCloser: rc, cancel: cancel, doneCh: doneCh, logger: bklog.G(ctx)}, nil
 }
 
@@ -110,7 +110,7 @@ func trackProgress(ctx context.Context, desc ocispecs.Descriptor, manager PullMa
 		case <-ctx.Done():
 			onFinalStatus = true
 			// we need a context for the manager.Status() calls to pass once. after that this function will exit
-			ctx = context.TODO()
+			ctx = context.WithoutCancel(ctx) //nolint:fatcontext // ignore "nested context in loop"
 		case <-ticker.C:
 		}
 

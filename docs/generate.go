@@ -15,18 +15,24 @@ import (
 func main() {
 	re := regexp.MustCompile("(?s)<!---GENERATE_START (.*?)-->(.*?)<!---GENERATE_END-->\n")
 
-	err := filepath.Walk("./docs", func(path string, stat fs.FileInfo, err error) error {
+	root, err := os.OpenRoot("./docs")
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if stat.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
 		if filepath.Ext(path) != ".md" {
 			return nil
 		}
 
-		data, err := os.ReadFile(path)
+		data, err := root.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -35,7 +41,7 @@ func main() {
 			groups := re.FindStringSubmatch(string(match))
 			stdout := bytes.NewBuffer(nil)
 			fmt.Fprintf(stdout, "<!---GENERATE_START %s-->\n", groups[1])
-			fmt.Fprintf(stdout, "```\n")
+			fmt.Fprint(stdout, "```\n")
 			cmd := exec.Cmd{
 				Path:   "/bin/sh",
 				Args:   []string{"sh", "-c", groups[1]},
@@ -51,8 +57,8 @@ func main() {
 				err = errors.Wrapf(err, "could not run command %s", groups[1])
 				return nil
 			}
-			fmt.Fprintf(stdout, "```\n")
-			fmt.Fprintf(stdout, "<!---GENERATE_END-->\n")
+			fmt.Fprint(stdout, "```\n")
+			fmt.Fprint(stdout, "<!---GENERATE_END-->\n")
 
 			return stdout.Bytes()
 		})
@@ -61,14 +67,21 @@ func main() {
 		}
 
 		if !bytes.Equal(data, dataNew) {
-			fmt.Println(path)
-			if err := os.WriteFile(path, dataNew, stat.Mode()); err != nil {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			fmt.Println(filepath.Join("docs", path))
+			if err := root.WriteFile(path, dataNew, info.Mode()); err != nil {
 				return err
 			}
 		}
 
 		return nil
 	})
+	if closeErr := root.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)

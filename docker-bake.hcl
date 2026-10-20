@@ -272,7 +272,7 @@ target "lint" {
   matrix = {
     buildtags = [
       { name = "default", tags = "", target = "golangci-lint" },
-      { name = "labs", tags = "dfrundevice", target = "golangci-lint" },
+      { name = "labs", tags = "", target = "golangci-lint" },
       { name = "nydus", tags = "nydus", target = "golangci-lint" },
       { name = "yaml", tags = "", target = "yamllint" },
       { name = "golangci-verify", tags = "", target = "golangci-verify" },
@@ -428,11 +428,11 @@ target "docs-dockerfile" {
   output = ["./frontend/dockerfile/docs/rules"]
 }
 
-target "mod-outdated" {
+target "gomod-updates" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/vendor.Dockerfile"
-  target = "outdated"
-  no-cache-filter = ["outdated"]
+  target = "gomod-updates"
+  no-cache-filter = ["gomod-updates"]
   output = ["type=cacheonly"]
 }
 

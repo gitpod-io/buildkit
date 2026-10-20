@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -8,13 +9,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,9 +28,14 @@ import (
 	"github.com/moby/buildkit/client/llb/sourceresolver"
 	gateway "github.com/moby/buildkit/frontend/gateway/client"
 	pb "github.com/moby/buildkit/frontend/gateway/pb"
+	solvererrdefs "github.com/moby/buildkit/solver/errdefs"
+	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	opspb "github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/sourcepolicy"
 	sourcepolicypb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/sourcepolicy/policysession"
+	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/pgpsign"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/moby/buildkit/util/testutil/workers"
@@ -36,6 +45,605 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
+
+func testProxyNetworkNoRootless(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	payload := []byte("buildkit proxy ok\n")
+	convertedPayload := []byte("buildkit proxy converted ok\n")
+	httpSrv, httpURL := newProxyHTTPServer(t, "0.0.0.0", testHostIP(t), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/allowed":
+			_, _ = w.Write(payload)
+		case "/bar":
+			_, _ = w.Write(convertedPayload)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+	}))
+	defer httpSrv.Close()
+	var leakHit atomic.Int32
+	leakSrv, leakURL := newProxyHTTPServer(t, "0.0.0.0", testHostIP(t), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leakHit.Add(1)
+		_, _ = w.Write([]byte("host namespace leak\n"))
+	}))
+	defer leakSrv.Close()
+	_, leakPort, err := net.SplitHostPort(strings.TrimPrefix(leakURL, "http://"))
+	require.NoError(t, err)
+
+	st := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c 'wget -q -O- %s/allowed | grep "buildkit proxy ok"'`, httpURL)).
+		Root().
+		Run(llb.Shlex(`sh -c '! wget -S -O- https://buildkit-ca-test.invalid/denied 2>/tmp/wget.log; grep "HTTP/1.1 502 Bad Gateway" /tmp/wget.log'`)).
+		Root().
+		Run(llb.Shlex(`sh -c 'unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; ! wget -T 2 -q -O- http://1.1.1.1/'`)).
+		Root().
+		Run(llb.Shlexf(`sh -c 'proxy=${HTTP_PROXY#http://}; host=${proxy%%:*}; unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; ! wget -T 2 -q -O- http://$host:%s/'`, leakPort)).
+		Root().
+		Run(llb.Shlex(`sh -c 'grep "buildkit proxy CA begin" /etc/ssl/certs/ca-certificates.crt'`)).
+		Root().
+		Run(llb.Shlex(`sh -c '! grep "buildkit proxy CA begin" /etc/ssl/certs/ca-certificates.crt'`), llb.Network(llb.NetModeNone))
+
+	def, err := st.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int32(0), leakHit.Load())
+
+	cleanupDestDir := t.TempDir()
+	cleanupFailure := llb.Image("alpine:latest").
+		Run(
+			llb.Shlex(
+				`sh -c 'touch /exec-completed && dd if=/dev/zero bs=1048576 count=11 >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null'`,
+			),
+			llb.IgnoreCache,
+		).
+		Root()
+	def, err = cleanupFailure.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: cleanupDestDir,
+		}},
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "failed to clean up proxy CA")
+	require.ErrorContains(t, err, "exceeds 10485760 bytes")
+	require.NoFileExists(t, filepath.Join(cleanupDestDir, "exec-completed"))
+
+	processAndCleanupFailure := llb.Image("alpine:latest").
+		Run(
+			llb.Shlex(
+				`sh -c 'dd if=/dev/zero bs=1048576 count=11 >> /etc/ssl/certs/ca-certificates.crt 2>/dev/null && exit 42'`,
+			),
+			llb.IgnoreCache,
+		).
+		Root()
+	def, err = processAndCleanupFailure.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "exit code: 42")
+	require.ErrorContains(t, err, "failed to clean up proxy CA")
+	require.ErrorContains(t, err, "exceeds 10485760 bytes")
+
+	var checked atomic.Int32
+	denyProvider := policysession.NewPolicyProvider(func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+		if req.Source.Source.Identifier != httpURL+"/allowed" {
+			return &policysession.DecisionResponse{
+				Action: sourcepolicypb.PolicyAction_ALLOW,
+			}, nil, nil
+		}
+		checked.Add(1)
+		return &policysession.DecisionResponse{
+			Action: sourcepolicypb.PolicyAction_DENY,
+		}, nil, nil
+	})
+
+	deny := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`wget -q -O- %s/allowed`, httpURL), llb.IgnoreCache)
+	def, err = deny.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork:         true,
+		SourcePolicyProvider: denyProvider,
+	}, nil)
+	require.Error(t, err)
+	require.Equal(t, int32(1), checked.Load())
+
+	destDir := t.TempDir()
+	withProvenance := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c 'wget -q -O /out/proxy-material %s/allowed'`, httpURL)).
+		AddMount("/out", llb.Scratch())
+	def, err = withProvenance.Marshal(ctx)
+	require.NoError(t, err)
+	materialURL := httpURL + "/allowed"
+	statusCh := make(chan *SolveStatus)
+	logsCh := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		for st := range statusCh {
+			for _, l := range st.Logs {
+				b.Write(l.Data)
+			}
+		}
+		logsCh <- b.String()
+	}()
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "mode=max,version=v1",
+		},
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: destDir,
+		}},
+	}, statusCh)
+	require.NoError(t, err)
+	logOutput := <-logsCh
+	require.Contains(t, logOutput, "proxy network requests:\n- GET "+materialURL)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "proxy-material"))
+	require.NoError(t, err)
+	require.Equal(t, payload, dt)
+
+	provDt, err := os.ReadFile(filepath.Join(destDir, "provenance.json"))
+	require.NoError(t, err)
+	var stmt struct {
+		intoto.StatementHeader
+		Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+	}
+	require.NoError(t, json.Unmarshal(provDt, &stmt))
+	foundMaterial := false
+	expectedDigest := digest.FromBytes(payload)
+	for _, m := range stmt.Predicate.BuildDefinition.ResolvedDependencies {
+		if m.URI == materialURL {
+			foundMaterial = true
+			require.Equal(t, expectedDigest.Hex(), m.Digest["sha256"])
+		}
+	}
+	require.True(t, foundMaterial, "expected to find %q in %+v", materialURL, stmt.Predicate.BuildDefinition.ResolvedDependencies)
+	require.False(t, stmt.Predicate.RunDetails.Metadata.Hermetic)
+	require.True(t, stmt.Predicate.RunDetails.Metadata.Completeness.ResolvedDependencies)
+	require.NotNil(t, stmt.Predicate.RunDetails.Metadata.BuildKitMetadata.Network)
+	require.Equal(t, "proxy", stmt.Predicate.RunDetails.Metadata.BuildKitMetadata.Network.Mode)
+
+	convertDestDir := t.TempDir()
+	convertFooURL := httpURL + "/foo"
+	convertBarURL := httpURL + "/bar"
+	convert := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c 'wget -q -O /out/proxy-material %s'`, convertFooURL)).
+		AddMount("/out", llb.Scratch())
+	def, err = convert.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+		SourcePolicy: &sourcepolicypb.Policy{
+			Rules: []*sourcepolicypb.Rule{
+				{
+					Action: sourcepolicypb.PolicyAction_CONVERT,
+					Selector: &sourcepolicypb.Selector{
+						Identifier: convertFooURL,
+					},
+					Updates: &sourcepolicypb.Update{
+						Identifier: convertBarURL,
+					},
+				},
+			},
+		},
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "mode=max,version=v1",
+		},
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: convertDestDir,
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err = os.ReadFile(filepath.Join(convertDestDir, "proxy-material"))
+	require.NoError(t, err)
+	require.Equal(t, convertedPayload, dt)
+
+	provDt, err = os.ReadFile(filepath.Join(convertDestDir, "provenance.json"))
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(provDt, &stmt))
+	foundMaterial = false
+	expectedDigest = digest.FromBytes(convertedPayload)
+	for _, m := range stmt.Predicate.BuildDefinition.ResolvedDependencies {
+		require.NotEqual(t, convertFooURL, m.URI)
+		if m.URI == convertBarURL {
+			foundMaterial = true
+			require.Equal(t, expectedDigest.Hex(), m.Digest["sha256"])
+		}
+	}
+	require.True(t, foundMaterial, "expected to find %q in %+v", convertBarURL, stmt.Predicate.BuildDefinition.ResolvedDependencies)
+
+	strict := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c 'wget -q -O- %s/missing || true'`, httpURL)).
+		AddMount("/out", llb.Scratch())
+	def, err = strict.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "mode=max,version=v1,complete-materials=true",
+		},
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: t.TempDir(),
+		}},
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "provenance materials are incomplete")
+	require.ErrorContains(t, err, "/missing")
+	var materialsErr *solvererrdefs.ProvenanceMaterialsIncompleteError
+	require.ErrorAs(t, err, &materialsErr)
+	require.Len(t, materialsErr.Incomplete, 1)
+	require.Equal(t, httpURL+"/missing", materialsErr.Incomplete[0].Uri)
+	require.Equal(t, "unsuccessful_response", materialsErr.Incomplete[0].Reason)
+}
+
+func testProxyNetworkGatewayExecEnvNoRootless(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+	childEnv := bytes.NewBuffer(nil)
+
+	_, err = c.Build(ctx, SolveOpt{ProxyNetwork: true}, "proxy-network-gateway-exec-env", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		def, err := llb.Image("busybox:latest").Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		res, err := c.Solve(ctx, gateway.SolveRequest{Definition: def.ToPB()})
+		if err != nil {
+			return nil, err
+		}
+		ctr, err := c.NewContainer(ctx, gateway.NewContainerRequest{
+			Mounts: []gateway.Mount{{
+				Dest:      "/",
+				MountType: opspb.MountType_BIND,
+				Ref:       res.Ref,
+			}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		pid1, err := ctr.Start(ctx, gateway.StartRequest{
+			Args: []string{"sleep", "30"},
+			Env: []string{
+				"INIT_ONLY=must-not-leak",
+				"ALL_PROXY=http://initial-process-proxy.invalid",
+			},
+		})
+		if err != nil {
+			_ = ctr.Release(context.WithoutCancel(ctx))
+			return nil, err
+		}
+		defer func() {
+			_ = ctr.Release(context.WithoutCancel(ctx))
+			_ = pid1.Wait()
+		}()
+
+		pid2, err := ctr.Start(ctx, gateway.StartRequest{
+			Args: []string{"env"},
+			Env: []string{
+				"CHILD_ENV=preserved",
+				"ALL_PROXY=http://child-process-proxy.invalid",
+			},
+			Stdout: &iohelper.NopWriteCloser{Writer: childEnv},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if err := pid2.Wait(); err != nil {
+			return nil, err
+		}
+		return &gateway.Result{}, nil
+	}, nil)
+	require.NoError(t, err)
+
+	env := strings.Split(strings.TrimSpace(childEnv.String()), "\n")
+	require.Contains(t, env, "CHILD_ENV=preserved")
+	require.NotContains(t, env, "ALL_PROXY=http://child-process-proxy.invalid")
+	require.NotContains(t, env, "ALL_PROXY=http://initial-process-proxy.invalid")
+	require.NotContains(t, env, "INIT_ONLY=must-not-leak")
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"} {
+		require.NotEmptyf(t, values[name], "%s is not set in the gateway exec environment:\n%s", name, childEnv.String())
+	}
+	require.Equal(t, values["HTTP_PROXY"], values["ALL_PROXY"])
+	require.Equal(t, values["http_proxy"], values["all_proxy"])
+}
+
+func testProxyNetworkModesNoRootless(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	workers.CheckFeatureCompat(t, sb, workers.FeatureCNINetwork)
+	if os.Getenv("BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS") == "" {
+		t.SkipNow()
+	}
+	if sb.Rootless() {
+		t.SkipNow()
+	}
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	hostPayload := []byte("proxy host ok\n")
+	var hostHit atomic.Int32
+	hostSrv, hostURL := newProxyHTTPServer(t, "127.0.0.1", "127.0.0.1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hostHit.Add(1)
+		if r.URL.Path != "/host" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(hostPayload)
+	}))
+	defer hostSrv.Close()
+	hostPath := hostURL + "/host"
+
+	internetURL := "http://example.com/"
+	allowedHost := []string{entitlements.EntitlementNetworkHost.String()}
+	defaultHasHostLoopback := proxyNetModeDefaultHasHostLoopback(sb)
+
+	// Host mode without the network.host entitlement should be rejected before exec starts.
+	hostWithoutEntitlement := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`wget -q -O- %s`, hostPath), llb.Network(llb.NetModeHost), llb.IgnoreCache).
+		Root()
+	def, err := hostWithoutEntitlement.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		ProxyNetwork: true,
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "network.host is not allowed")
+	require.Equal(t, int32(0), hostHit.Load())
+
+	runProxySolve := func(name string, st llb.State, allowedEntitlements []string) (string, error) {
+		t.Helper()
+		def, err := st.Marshal(ctx)
+		require.NoError(t, err, name)
+
+		statusCh := make(chan *SolveStatus)
+		logsCh := make(chan string, 1)
+		go func() {
+			var b strings.Builder
+			for st := range statusCh {
+				for _, l := range st.Logs {
+					b.Write(l.Data)
+				}
+			}
+			logsCh <- b.String()
+		}()
+
+		_, err = c.Solve(ctx, def, SolveOpt{
+			ProxyNetwork:        true,
+			AllowedEntitlements: allowedEntitlements,
+		}, statusCh)
+		return <-logsCh, err
+	}
+
+	// Default proxy egress should allow normal external network access.
+	logOutput, err := runProxySolve("default internet", llb.Image("alpine:latest").
+		Run(llb.Shlexf(`wget -q -O /tmp/internet %s`, internetURL), llb.IgnoreCache).
+		Root(), nil)
+	require.NoError(t, err)
+	require.Contains(t, logOutput, "proxy network requests:\n- GET "+internetURL+" -> 200")
+	require.Equal(t, int32(0), hostHit.Load())
+
+	expectedHostHits := int32(0)
+	if defaultHasHostLoopback {
+		// Proxy UNSET should follow the worker default provider, including host fallback/default.
+		logOutput, err = runProxySolve("default host fallback", llb.Image("alpine:latest").
+			Run(llb.Shlexf(`sh -c 'env NO_PROXY= no_proxy= wget -q -O- %s | grep "proxy host ok"'`, hostPath), llb.IgnoreCache).
+			Root(), nil)
+		require.NoError(t, err)
+		require.Contains(t, logOutput, "proxy network requests:\n- GET "+hostPath+" -> 200")
+		expectedHostHits = 1
+		require.Equal(t, expectedHostHits, hostHit.Load())
+	} else {
+		// Bridge proxy egress should not reach services bound to buildkitd host loopback.
+		logOutput, err = runProxySolve("bridge host", llb.Image("alpine:latest").
+			// Clear NO_PROXY so the localhost URL is forced through the BuildKit proxy.
+			Run(llb.Shlexf(`sh -c '! env NO_PROXY= no_proxy= wget -T 2 -q -O- %s'`, hostPath), llb.IgnoreCache).
+			Root(), nil)
+		require.NoError(t, err)
+		require.Contains(t, logOutput, "proxy network requests:\n- GET "+hostPath+" -> 502")
+		require.Equal(t, expectedHostHits, hostHit.Load())
+	}
+
+	// Host proxy egress is allowed only with the network.host entitlement.
+	logOutput, err = runProxySolve("host allowed", llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c 'env NO_PROXY= no_proxy= wget -q -O- %s | grep "proxy host ok"'`, hostPath), llb.Network(llb.NetModeHost), llb.IgnoreCache).
+		Root(), allowedHost)
+	require.NoError(t, err)
+	require.Contains(t, logOutput, "proxy network requests:\n- GET "+hostPath+" -> 200")
+	expectedHostHits++
+	require.Equal(t, expectedHostHits, hostHit.Load())
+
+	// None mode should not inject proxy env or allow external network access.
+	logOutput, err = runProxySolve("none internet", llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c '! env | grep -i "^HTTP_PROXY="; ! wget -T 2 -q -O- %s'`, internetURL), llb.Network(llb.NetModeNone), llb.IgnoreCache).
+		Root(), nil)
+	require.NoError(t, err)
+	require.NotContains(t, logOutput, internetURL)
+
+	// None mode should also be unable to reach buildkitd host loopback.
+	logOutput, err = runProxySolve("none host", llb.Image("alpine:latest").
+		Run(llb.Shlexf(`sh -c '! env | grep -i "^HTTP_PROXY="; ! wget -T 2 -q -O- %s'`, hostPath), llb.Network(llb.NetModeNone), llb.IgnoreCache).
+		Root(), nil)
+	require.NoError(t, err)
+	require.NotContains(t, logOutput, hostPath)
+	require.Equal(t, expectedHostHits, hostHit.Load())
+}
+
+func testProxyNetworkDefaultEgressNoRootless(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	if sb.Rootless() {
+		t.SkipNow()
+	}
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	hostSrv, hostURL := newProxyHTTPServer(t, "127.0.0.1", "127.0.0.1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/host-default", "/denied":
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte("proxy host default ok\n"))
+	}))
+	defer hostSrv.Close()
+
+	runProxySolve := func(st llb.State, opt SolveOpt) (string, error) {
+		t.Helper()
+		def, err := st.Marshal(ctx)
+		require.NoError(t, err)
+
+		statusCh := make(chan *SolveStatus)
+		logsCh := make(chan string, 1)
+		go func() {
+			var b strings.Builder
+			for st := range statusCh {
+				for _, l := range st.Logs {
+					b.Write(l.Data)
+				}
+			}
+			logsCh <- b.String()
+		}()
+
+		_, err = c.Solve(ctx, def, opt, statusCh)
+		return <-logsCh, err
+	}
+
+	defaultHasHostLoopback := proxyNetModeDefaultHasHostLoopback(sb)
+	hostDefaultCmd := llb.Shlexf(`sh -c 'env NO_PROXY= no_proxy= wget -q -O- %s/host-default | grep "proxy host default ok"'`, hostURL)
+	if !defaultHasHostLoopback {
+		hostDefaultCmd = llb.Shlexf(`sh -c '! env NO_PROXY= no_proxy= wget -T 2 -q -O- %s/host-default'`, hostURL)
+	}
+	st := llb.Image("alpine:latest").
+		Run(hostDefaultCmd, llb.IgnoreCache).
+		Root()
+	logOutput, err := runProxySolve(st, SolveOpt{
+		ProxyNetwork: true,
+	})
+	require.NoError(t, err)
+	if defaultHasHostLoopback {
+		require.Contains(t, logOutput, "proxy network requests:\n- GET "+hostURL+"/host-default -> 200")
+	} else {
+		require.Contains(t, logOutput, "proxy network requests:\n- GET "+hostURL+"/host-default -> 502")
+	}
+
+	var checked atomic.Int32
+	denyProvider := policysession.NewPolicyProvider(func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+		if req.Source.Source.Identifier == hostURL+"/denied" {
+			checked.Add(1)
+			return &policysession.DecisionResponse{
+				Action: sourcepolicypb.PolicyAction_DENY,
+			}, nil, nil
+		}
+		return &policysession.DecisionResponse{
+			Action: sourcepolicypb.PolicyAction_ALLOW,
+		}, nil, nil
+	})
+
+	deny := llb.Image("alpine:latest").
+		Run(llb.Shlexf(`env NO_PROXY= no_proxy= wget -S -O- %s/denied`, hostURL), llb.IgnoreCache).
+		Root()
+	logOutput, err = runProxySolve(deny, SolveOpt{
+		ProxyNetwork:         true,
+		SourcePolicyProvider: denyProvider,
+	})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "exit code: 1")
+	require.Contains(t, logOutput, "HTTP/1.1 403 Forbidden")
+	require.Equal(t, int32(1), checked.Load())
+	require.NotContains(t, err.Error(), "unknown proxy egress network mode UNSET")
+}
+
+func proxyNetModeDefaultHasHostLoopback(sb integration.Sandbox) bool {
+	if sb.DockerAddress() != "" {
+		return false
+	}
+	switch sb.Value("netmode").(type) {
+	case *netModeProxyDefaultNoCNI, *netModeProxyHost:
+		return true
+	default:
+		return false
+	}
+}
+
+func newProxyHTTPServer(t *testing.T, listenHost, urlHost string, handler http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp4", net.JoinHostPort(listenHost, "0"))
+	require.NoError(t, err)
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Listener = ln
+	srv.Start()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	return srv, "http://" + net.JoinHostPort(urlHost, port)
+}
+
+func testHostIP(t *testing.T) string {
+	t.Helper()
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "udp4", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && !addr.IP.IsLoopback() {
+			return addr.IP.String()
+		}
+	}
+	ifaces, err := net.Interfaces()
+	require.NoError(t, err)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		require.NoError(t, err)
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip != nil && !ip.IsLoopback() {
+				return ip.String()
+			}
+		}
+	}
+	t.Fatal("could not find non-loopback host IP for proxy integration test")
+	return ""
+}
 
 func testSourcePolicySession(t *testing.T, sb integration.Sandbox) {
 	requiresLinux(t)
@@ -94,6 +702,29 @@ func testSourcePolicySession(t *testing.T, sb integration.Sandbox) {
 				},
 			},
 			expectedError: "policy denied",
+		},
+		{
+			name: "deny git bundle",
+			state: func() llb.State {
+				return llb.Git(
+					"https://example.com/repo.git",
+					"",
+					llb.GitChecksum("1111111111111111111111111111111111111111"),
+					llb.GitBundleURL("oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				)
+			},
+			callbacks: []policysession.PolicyCallback{
+				func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+					require.Equal(t, "git://example.com/repo.git", req.Source.Source.Identifier)
+					return &policysession.DecisionResponse{Action: sourcepolicypb.PolicyAction_ALLOW}, nil, nil
+				},
+				func(ctx context.Context, req *policysession.CheckPolicyRequest) (*policysession.DecisionResponse, *pb.ResolveSourceMetaRequest, error) {
+					require.Equal(t, "oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", req.Source.Source.Identifier)
+					require.Equal(t, "local/git-bundle", req.Source.Source.Attrs[opspb.AttrOCILayoutStoreID])
+					return &policysession.DecisionResponse{Action: sourcepolicypb.PolicyAction_DENY}, nil, nil
+				},
+			},
+			expectedError: "not allowed by policy",
 		},
 		{
 			name:  "alpine with digest policy",
@@ -344,7 +975,7 @@ func testSourceMetaPolicySessionResolveAttestations(t *testing.T, sb integration
 
 				var stmt intoto.Statement
 				require.NoError(t, json.Unmarshal(blob.Data, &stmt))
-				require.Equal(t, "https://in-toto.io/Statement/v0.1", stmt.Type)
+				require.Equal(t, intoto.StatementInTotoV1, stmt.Type)
 				require.Equal(t, layerPredicateType, stmt.PredicateType)
 				require.NotEmpty(t, stmt.Subject)
 				require.Equal(t, imageManifestDigest.Hex(), stmt.Subject[0].Digest["sha256"])
@@ -1097,4 +1728,264 @@ func tamperDigestHex(dgst digest.Digest) digest.Digest {
 		hexPart[len(hexPart)-1] = '0'
 	}
 	return digest.NewDigestFromEncoded(dgst.Algorithm(), string(hexPart))
+}
+
+func testSourcePolicy(t *testing.T, sb integration.Sandbox) {
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		st := llb.Image("busybox:1.34.1-uclibc").File(
+			llb.Copy(llb.HTTP("https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md"),
+				"README.md", "README.md"))
+		def, err := st.Marshal(sb.Context())
+		if err != nil {
+			return nil, err
+		}
+		return c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+	}
+
+	type testCase struct {
+		srcPol      *sourcepolicypb.Policy
+		expectedErr string
+	}
+	testCases := []testCase{
+		{
+			// Valid
+			srcPol: &sourcepolicypb.Policy{
+				Rules: []*sourcepolicypb.Rule{
+					{
+						Action: sourcepolicypb.PolicyAction_CONVERT,
+						Selector: &sourcepolicypb.Selector{
+							Identifier: "docker-image://docker.io/library/busybox:1.34.1-uclibc",
+						},
+						Updates: &sourcepolicypb.Update{
+							Identifier: "docker-image://docker.io/library/busybox:1.34.1-uclibc@sha256:3614ca5eacf0a3a1bcc361c939202a974b4902b9334ff36eb29ffe9011aaad83",
+						},
+					},
+					{
+						Action: sourcepolicypb.PolicyAction_CONVERT,
+						Selector: &sourcepolicypb.Selector{
+							Identifier: "https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md",
+						},
+						Updates: &sourcepolicypb.Update{
+							Identifier: "https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md",
+							Attrs:      map[string]string{"http.checksum": "sha256:6e4b94fc270e708e1068be28bd3551dc6917a4fc5a61293d51bb36e6b75c4b53"},
+						},
+					},
+				},
+			},
+			expectedErr: "",
+		},
+		{
+			// Invalid docker-image source
+			srcPol: &sourcepolicypb.Policy{
+				Rules: []*sourcepolicypb.Rule{
+					{
+						Action: sourcepolicypb.PolicyAction_CONVERT,
+						Selector: &sourcepolicypb.Selector{
+							Identifier: "docker-image://docker.io/library/busybox:1.34.1-uclibc",
+						},
+						Updates: &sourcepolicypb.Update{
+							Identifier: "docker-image://docker.io/library/busybox:1.34.1-uclibc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // invalid
+						},
+					},
+				},
+			},
+			expectedErr: "docker.io/library/busybox:1.34.1-uclibc@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: not found",
+		},
+		{
+			// Invalid http source
+			srcPol: &sourcepolicypb.Policy{
+				Rules: []*sourcepolicypb.Rule{
+					{
+						Action: sourcepolicypb.PolicyAction_CONVERT,
+						Selector: &sourcepolicypb.Selector{
+							Identifier: "https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md",
+						},
+						Updates: &sourcepolicypb.Update{
+							Attrs: map[string]string{opspb.AttrHTTPChecksum: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, // invalid
+						},
+					},
+				},
+			},
+			expectedErr: "digest mismatch sha256:6e4b94fc270e708e1068be28bd3551dc6917a4fc5a61293d51bb36e6b75c4b53: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+	}
+	for i, tc := range testCases {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			_, err = c.Build(sb.Context(), SolveOpt{SourcePolicy: tc.srcPol}, "", frontend, nil)
+			if tc.expectedErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.expectedErr)
+			}
+		})
+	}
+
+	t.Run("deny canonical git subdir", func(t *testing.T) {
+		const (
+			src       = "git://github.com/user/repo.git#main:../absolute/path"
+			canonical = "git://github.com/user/repo.git#main:absolute/path"
+		)
+		frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+			st := llb.NewState(llb.NewSource(src, nil, llb.Constraints{}).Output())
+			def, err := st.Marshal(sb.Context())
+			if err != nil {
+				return nil, err
+			}
+			return c.Solve(ctx, gateway.SolveRequest{
+				Definition: def.ToPB(),
+			})
+		}
+
+		_, err = c.Build(sb.Context(), SolveOpt{
+			SourcePolicy: &sourcepolicypb.Policy{
+				Rules: []*sourcepolicypb.Rule{
+					{
+						Action: sourcepolicypb.PolicyAction_DENY,
+						Selector: &sourcepolicypb.Selector{
+							Identifier: canonical,
+							MatchType:  sourcepolicypb.MatchType_EXACT,
+						},
+					},
+				},
+			},
+		}, "", frontend, nil)
+		require.ErrorContains(t, err, sourcepolicy.ErrSourceDenied.Error())
+	})
+
+	t.Run("deny git bundle source", func(t *testing.T) {
+		const checksum = "1111111111111111111111111111111111111111"
+		bundles := []string{
+			"docker-image+blob://registry.example.com/buildkit/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"oci-layout+blob://local/git-bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}
+		for _, bundle := range bundles {
+			scheme, _, _ := strings.Cut(bundle, "://")
+			t.Run(scheme, func(t *testing.T) {
+				frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+					st := llb.Git("https://example.com/repo.git", "", llb.GitChecksum(checksum), llb.GitBundleURL(bundle))
+					def, err := st.Marshal(sb.Context())
+					if err != nil {
+						return nil, err
+					}
+					return c.Solve(ctx, gateway.SolveRequest{Definition: def.ToPB()})
+				}
+
+				selector := &sourcepolicypb.Selector{
+					Identifier: bundle,
+					MatchType:  sourcepolicypb.MatchType_EXACT,
+				}
+				if scheme == "oci-layout+blob" {
+					selector.Constraints = []*sourcepolicypb.AttrConstraint{
+						{
+							Key:       opspb.AttrOCILayoutStoreID,
+							Value:     "local/git-bundle",
+							Condition: sourcepolicypb.AttrMatch_EQUAL,
+						},
+					}
+				}
+				_, err := c.Build(sb.Context(), SolveOpt{
+					SourcePolicy: &sourcepolicypb.Policy{Rules: []*sourcepolicypb.Rule{
+						{
+							Action:   sourcepolicypb.PolicyAction_DENY,
+							Selector: selector,
+						},
+					}},
+				}, "", frontend, nil)
+				require.ErrorContains(t, err, sourcepolicy.ErrSourceDenied.Error())
+			})
+		}
+	})
+
+	t.Run("Frontend policies", func(t *testing.T) {
+		t.Run("deny http", func(t *testing.T) {
+			denied := "https://raw.githubusercontent.com/moby/buildkit/v0.10.1/README.md"
+			frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+				st := llb.Image("busybox:1.34.1-uclibc").File(
+					llb.Copy(llb.HTTP(denied),
+						"README.md", "README.md"))
+				def, err := st.Marshal(sb.Context())
+				if err != nil {
+					return nil, err
+				}
+				return c.Solve(ctx, gateway.SolveRequest{
+					Definition: def.ToPB(),
+					SourcePolicies: []*sourcepolicypb.Policy{{
+						Rules: []*sourcepolicypb.Rule{
+							{
+								Action: sourcepolicypb.PolicyAction_DENY,
+								Selector: &sourcepolicypb.Selector{
+									Identifier: denied,
+								},
+							},
+						},
+					}},
+				})
+			}
+
+			_, err = c.Build(sb.Context(), SolveOpt{}, "", frontend, nil)
+			require.ErrorContains(t, err, sourcepolicy.ErrSourceDenied.Error())
+		})
+		t.Run("resolve image config", func(t *testing.T) {
+			frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+				const (
+					origRef    = "docker.io/library/busybox:1.34.1-uclibc"
+					updatedRef = "docker.io/library/busybox:latest"
+				)
+				pol := []*sourcepolicypb.Policy{
+					{
+						Rules: []*sourcepolicypb.Rule{
+							{
+								Action: sourcepolicypb.PolicyAction_DENY,
+								Selector: &sourcepolicypb.Selector{
+									Identifier: "*",
+								},
+							},
+							{
+								Action: sourcepolicypb.PolicyAction_ALLOW,
+								Selector: &sourcepolicypb.Selector{
+									Identifier: "docker-image://" + updatedRef + "*",
+								},
+							},
+							{
+								Action: sourcepolicypb.PolicyAction_CONVERT,
+								Selector: &sourcepolicypb.Selector{
+									Identifier: "docker-image://" + origRef,
+								},
+								Updates: &sourcepolicypb.Update{
+									Identifier: "docker-image://" + updatedRef,
+								},
+							},
+						},
+					},
+				}
+
+				ref, dgst, _, err := c.ResolveImageConfig(ctx, origRef, sourceresolver.Opt{
+					SourcePolicies: pol,
+				})
+				if err != nil {
+					return nil, err
+				}
+				require.Equal(t, updatedRef, ref)
+				st := llb.Image(ref + "@" + dgst.String())
+				def, err := st.Marshal(sb.Context())
+				if err != nil {
+					return nil, err
+				}
+				return c.Solve(ctx, gateway.SolveRequest{
+					Definition:     def.ToPB(),
+					SourcePolicies: pol,
+				})
+			}
+			_, err = c.Build(sb.Context(), SolveOpt{}, "", frontend, nil)
+			require.NoError(t, err)
+		})
+	})
 }

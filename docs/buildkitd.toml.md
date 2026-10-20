@@ -7,20 +7,20 @@ list of global settings followed by a series of sections for specific areas
 of daemon configuration.
 
 The file path is `/etc/buildkit/buildkitd.toml` for rootful mode,
-`~/.config/buildkit/buildkitd.toml` for rootless mode.
+`~/.config/buildkit/buildkitd.toml` for rootless mode. A different path can be
+set with the `--config` flag or the `BUILDKITD_CONFIG` environment variable.
 
 The following is a complete `buildkitd.toml` configuration example.
 Note that some configuration options are only useful in edge cases.
 
 ```toml
-# debug enables additional debug logging
-debug = true
-# trace enables additional trace logging (very verbose, with potential performance impacts)
-trace = true
 # root is where all buildkit state is stored.
 root = "/var/lib/buildkit"
 # insecure-entitlements allows insecure entitlements, disabled by default.
 insecure-entitlements = [ "network.host", "security.insecure", "device" ]
+# proxyNetwork enables proxy network enforcement for all builds, disabled by default.
+# It can also be enabled with buildkitd --proxy-network.
+proxyNetwork = true
 # provenanceEnvDir is the directory where extra config is loaded that is added
 # to the provenance of builds:
 # slsa v0.2: invocation.environment.*
@@ -30,6 +30,9 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
 [log]
   # log formatter: json or text
   format = "text"
+
+  # log level (error/warn/info/debug/trace)
+  level = "info"
 
 [dns]
   nameservers=["1.1.1.1","8.8.8.8"]
@@ -62,8 +65,35 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
 [history]
   # maxAge is the maximum age of history entries to keep, in seconds.
   maxAge = 172800
-  # maxEntries is the maximum number of history entries to keep.
+  # maxEntries is the maximum number of history entries to keep. When the
+  # history section is omitted, the default is 50. If only maxAge is set,
+  # all entries older than maxAge are removed.
+  # Setting this value to 0 prevents recording new build history, including
+  # active-build events. Existing records remain available until normal GC.
   maxEntries = 50
+
+[compaction]
+  # Opt-in metadata database maintenance, independent of cache GC.
+  enabled = false
+  # Committed write transactions between automatic eligibility checks.
+  writesPerCheck = 10000
+  # Database size is sampled at most every five minutes after committed writes.
+  # Initial minimum database size for growth-triggered eligibility checks.
+  sizeWatermark = 134217728
+  # After compaction, grow the next size watermark from the compacted size by
+  # this percentage.
+  sizeGrowthPercent = 100
+  # Either threshold can trigger compaction, subject to the percentage floor.
+  minReclaimBytes = 268435456
+  # Percentage of the database file estimated to be reclaimable.
+  minReclaimPercent = 30
+  # Minimum reclaimable percentage, even when minReclaimBytes is reached.
+  minReclaimPercentFloor = 10
+  # Wait for no active transactions and this interval without database activity.
+  idleTimeout = "1m"
+  # Cancel this many attempts for arriving writers, then let the next copy finish.
+  # Writers may wait for the full copy duration. Zero forces the first attempt.
+  maxRetry = 3
 
 [worker.oci]
   enabled = true
@@ -157,6 +187,8 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
   cniPoolSize = 16
   # defaultCgroupParent sets the parent cgroup of all containers.
   defaultCgroupParent = "buildkit"
+  # hypervIsolation enables Hyper-V isolation for Windows containers.
+  hypervIsolation = false
 
   [worker.containerd.labels]
     "foo" = "bar"
@@ -213,19 +245,31 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
 [system]
   # how often buildkit scans for changes in the supported emulated platforms
   platformsCacheMaxAge = "1h"
-
+  # maxRegistryConcurrency sets the maximum number of concurrent connections
+  # per registry. If unset, the default concurrency limit is used.
+  maxRegistryConcurrency = 4
+  # sessionAuthTimeout sets the timeout for daemon-side authentication
+  # round-trips with the buildx client session (resolving credentials and
+  # fetching auth tokens from the session). Can be a duration string
+  # (e.g. "60s") or a bare integer treated as seconds. If unset, the default
+  # timeout of 60s is used. A value of zero or less disables the timeout
+  # entirely.
+  sessionAuthTimeout = "60s"
 
 # optional signed cache configuration for GitHub Actions backend
-[ghacache.sign]
-# command that signs the payload in stdin and outputs the signature to stdout. Normally you want cosign to produce the signature bytes.
-cmd = ""
-[ghacache.verify]
-required = false
-[ghacache.verify.policy]
-timestampThreshold = 1
-tlogThreshold = 1
-# cetificate properties that need to match. Simple wildcards (*) are supported.
-certificateIssuer = ""
-subjectAlternativeName = ""
-buildSignerURI = ""
+# [cache.gha.sign]
+#   # command that signs the payload in stdin and outputs the signature to stdout.
+#   # Normally you want cosign to produce the signature bytes.
+#   command = ""
+#
+# [cache.gha.verify]
+#   required = false
+#
+# [cache.gha.verify.policy]
+#   timestampThreshold = 1
+#   tlogThreshold = 1
+#   # certificate properties that need to match. Simple wildcards (*) are supported.
+#   certificateIssuer = ""
+#   subjectAlternativeName = ""
+#   buildSignerURI = ""
 ```

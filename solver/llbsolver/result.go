@@ -98,9 +98,11 @@ func (rp *resultProxy) wrapError(err error) error {
 	var ve *errdefs.VertexError
 	if errors.As(err, &ve) {
 		if rp.req.Definition.Source != nil {
-			locs, ok := rp.req.Definition.Source.Locations[ve.Digest]
-			if ok {
+			if locs := rp.req.Definition.Source.Locations[ve.Digest]; locs != nil {
 				for _, loc := range locs.Locations {
+					if loc == nil || loc.SourceIndex < 0 || int(loc.SourceIndex) >= len(rp.req.Definition.Source.Infos) {
+						continue
+					}
 					err = errdefs.WithSource(err, &errdefs.Source{
 						Info:   rp.req.Definition.Source.Infos[loc.SourceIndex],
 						Ranges: loc.Ranges,
@@ -134,7 +136,7 @@ func (rp *resultProxy) Result(ctx context.Context) (res solver.CachedResult, err
 		rp.mu.Lock()
 		if rp.released {
 			rp.mu.Unlock()
-			return nil, errors.Errorf("accessing released result")
+			return nil, errors.New("accessing released result")
 		}
 		if rp.v != nil || rp.err != nil {
 			rp.mu.Unlock()
@@ -157,7 +159,7 @@ func (rp *resultProxy) Result(ctx context.Context) (res solver.CachedResult, err
 				v.Release(context.TODO())
 			}
 			rp.mu.Unlock()
-			return nil, errors.Errorf("evaluating released result")
+			return nil, errors.New("evaluating released result")
 		}
 		if err == nil {
 			var capture *provenance.Capture

@@ -27,6 +27,7 @@ linters:
     - testifylint
     - unused
     - usestdlibvars
+    - usetesting
     - whitespace
   settings:
     depguard:
@@ -79,6 +80,8 @@ linters:
         - unusedwrite
     importas:
       alias:
+        - pkg: go.etcd.io/bbolt
+          alias: bolt
         - pkg: github.com/containerd/errdefs
           alias: cerrdefs
         - pkg: github.com/opencontainers/image-spec/specs-go/v1
@@ -86,6 +89,14 @@ linters:
         - pkg: github.com/opencontainers/go-digest
           alias: digest
       no-unaliased: true
+    revive:
+      enable-all-rules: false
+      enable-default-rules: true
+      rules:
+        - name: errorf
+        - name: if-return
+        - name: unnecessary-format
+        - name: use-errors-new
     staticcheck:
       checks:
         - all
@@ -95,6 +106,9 @@ linters:
         - bool-compare
         - len
         - negative-positive
+    usetesting:
+      context-background: true
+      context-todo: true
   exclusions:
     generated: lax
     presets:
@@ -130,6 +144,7 @@ linters:
     paths:
       - .*\.pb\.go$
       - examples
+    warn-unused: true
 
 formatters:
   enable:

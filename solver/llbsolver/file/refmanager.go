@@ -66,12 +66,15 @@ func (rm *RefManager) Commit(ctx context.Context, mount fileoptypes.Mount) (file
 		return nil, errors.Errorf("invalid mount type %T", mount)
 	}
 	if m.mr == nil {
-		return nil, errors.Errorf("invalid mount without active ref for commit")
+		return nil, errors.New("invalid mount without active ref for commit")
 	}
-	defer func() {
-		m.mr = nil
-	}()
-	return m.mr.Commit(ctx)
+	ref, err := m.mr.Commit(ctx)
+	if err != nil {
+		// Release the mutable so a failed Commit doesn't orphan it.
+		m.mr.Release(context.WithoutCancel(ctx))
+	}
+	m.mr = nil
+	return ref, err
 }
 
 type Mount struct {

@@ -3,8 +3,10 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/continuity/fs"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend"
@@ -13,12 +15,15 @@ import (
 	"github.com/moby/buildkit/solver/llbsolver/ops/opsutils"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/moby/buildkit/util/openfile"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 )
 
 const buildCacheType = "buildkit.build.v0"
+
+const maxBuildDefinitionSize = defaults.DefaultMaxRecvMsgSize
 
 type BuildOp struct {
 	op *pb.BuildOp
@@ -67,7 +72,7 @@ func (b *BuildOp) CacheMap(ctx context.Context, job solver.JobContext, index int
 
 func (b *BuildOp) Exec(ctx context.Context, job solver.JobContext, inputs []solver.Result) (outputs []solver.Result, retErr error) {
 	if b.op.Builder != int64(pb.LLBBuilder) {
-		return nil, errors.Errorf("only LLB builder is currently allowed")
+		return nil, errors.New("only LLB builder is currently allowed")
 	}
 
 	builderInputs := b.op.Inputs
@@ -77,7 +82,7 @@ func (b *BuildOp) Exec(ctx context.Context, job solver.JobContext, inputs []solv
 	}
 
 	i := int(llbDef.Input)
-	if i >= len(inputs) {
+	if i < 0 || i >= len(inputs) {
 		return nil, errors.Errorf("invalid index %v", i) // TODO: this should be validated before
 	}
 	inp := inputs[i]
@@ -111,17 +116,30 @@ func (b *BuildOp) Exec(ctx context.Context, job solver.JobContext, inputs []solv
 		fn = override
 	}
 
+	// paths below are daemon-side locations, report the requested filename
+	defer func() {
+		var pathErr *os.PathError
+		if errors.As(retErr, &pathErr) {
+			pathErr.Path = fn
+		}
+	}()
+
 	newfn, err := fs.RootPath(root, fn)
 	if err != nil {
 		return nil, errors.Wrapf(err, "working dir %s points to invalid target", fn)
 	}
 
-	f, err := os.Open(newfn)
+	f, err := openfile.Regular(newfn)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open %s", newfn)
+		return nil, err
 	}
 
-	def, err := llb.ReadFrom(f)
+	lr := &io.LimitedReader{R: f, N: int64(maxBuildDefinitionSize) + 1}
+	def, err := llb.ReadFrom(lr)
+	if lr.N == 0 {
+		f.Close()
+		return nil, errors.Errorf("%s exceeds maximum allowed size of %d bytes", fn, maxBuildDefinitionSize)
+	}
 	if err != nil {
 		f.Close()
 		return nil, err

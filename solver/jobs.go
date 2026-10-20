@@ -11,6 +11,7 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/solver/llbsolver/compat"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/bkmaps"
 	"github.com/moby/buildkit/util/flightcontrol"
@@ -64,7 +65,7 @@ type state struct {
 	clientVertex client.Vertex
 	origDigest   digest.Digest // original LLB digest. TODO: probably better to use string ID so this isn't needed
 
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	op    *sharedOp
 	edges map[Index]*edge
 	opts  SolverOpt
@@ -72,6 +73,7 @@ type state struct {
 
 	cache     map[string]CacheManager
 	mainCache CacheManager
+	metadata  VertexMetadata
 	solver    *Solver
 }
 
@@ -86,17 +88,60 @@ func (s *state) Cleanup(fn func() error) error {
 	return nil
 }
 
+// cloneUntilRelease borrows the solver's lifetime lock so the state and its
+// dependencies stay alive until the clone has been registered for cleanup.
+func (s *state) cloneUntilRelease(res Result) Result {
+	s.solver.mu.RLock()
+	defer s.solver.mu.RUnlock()
+	if s.solver.actives[s.vtx.Digest()] != s {
+		return nil
+	}
+	clone := res.Clone()
+	s.Cleanup(func() error {
+		return clone.Release(context.TODO())
+	})
+	return clone
+}
+
 func (s *state) ResolverCache() ResolverCache {
 	return s
 }
 
+func (s *state) CompatibilityVersion() (int, error) {
+	s.mu.RLock()
+	jobs := make([]*Job, 0, len(s.jobs))
+	for j := range s.jobs {
+		jobs = append(jobs, j)
+	}
+	s.mu.RUnlock()
+
+	version := 0
+	for _, j := range jobs {
+		v, err := j.CompatibilityVersion()
+		if err != nil {
+			return 0, err
+		}
+		if version == 0 {
+			version = v
+			continue
+		}
+		if version != v {
+			return 0, errors.Errorf("conflicting compatibility versions in shared solve state: %d != %d", version, v)
+		}
+	}
+	if version == 0 {
+		return compat.CompatibilityVersionCurrent, nil
+	}
+	return version, nil
+}
+
 func (s *state) Lock(key any) (values []any, release func(any) error, err error) {
 	var rcs []ResolverCache
-	s.mu.Lock()
+	s.mu.RLock()
 	for j := range s.jobs {
 		rcs = append(rcs, j.resolverCache)
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	return combinedResolverCache(rcs).Lock(key)
 }
@@ -208,7 +253,9 @@ func (s *state) setEdge(index Index, targetEdge *edge, targetState *state) {
 
 	if targetState != nil {
 		targetState.addJobs(s, map[*state]struct{}{})
+		targetState.mu.Lock()
 		targetState.releasers = append(targetState.releasers, s.releasers...)
+		targetState.mu.Unlock()
 		s.releasers = nil
 
 		targetState.allPwMu.Lock()
@@ -266,19 +313,20 @@ func (s *state) addJobs(srcState *state, memo map[*state]struct{}) {
 }
 
 func (s *state) combinedCacheManager() CacheManager {
-	s.mu.Lock()
+	s.mu.RLock()
 	cms := make([]CacheManager, 0, len(s.cache)+1)
-	cms = append(cms, s.mainCache)
+	mainCache := s.mainCache
+	cms = append(cms, mainCache)
 	for _, cm := range s.cache {
 		cms = append(cms, cm)
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if len(cms) == 1 {
-		return s.mainCache
+		return mainCache
 	}
 
-	return NewCombinedCacheManager(cms, s.mainCache)
+	return NewCombinedCacheManager(cms, mainCache)
 }
 
 func (s *state) Release() {
@@ -324,9 +372,14 @@ func (sb *subBuilder) InContext(ctx context.Context, f func(context.Context, Job
 }
 
 func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(any) error) error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
+	sb.state.mu.RLock()
+	jobs := make([]*Job, 0, len(sb.jobs))
 	for j := range sb.jobs {
+		jobs = append(jobs, j)
+	}
+	sb.state.mu.RUnlock()
+
+	for _, j := range jobs {
 		if err := j.EachValue(ctx, key, fn); err != nil {
 			return err
 		}
@@ -593,6 +646,13 @@ func (jl *Solver) loadUnlocked(ctx context.Context, v, parent Vertex, j *Job, ca
 			}
 		}
 	}
+	if md := v.Options().Metadata; md != nil {
+		if st.metadata == nil {
+			st.metadata = md
+		} else {
+			st.metadata = st.metadata.Merge(md)
+		}
+	}
 
 	if j != nil {
 		if _, ok := st.jobs[j]; !ok {
@@ -782,6 +842,11 @@ func (j *Job) walkProvenance(ctx context.Context, e Edge, f func(ProvenanceProvi
 		return nil
 	}
 	visited[e.Vertex.Digest()] = struct{}{}
+	// Walk via the resolved state's inputs when available, so the recursion
+	// follows the chain that was actually scheduled rather than the caller's
+	// wrapper graph (which can reference orphan states via the
+	// dgstWithoutCache shift in loadUnlocked).
+	inputs := e.Vertex.Inputs()
 	if st, ok := j.list.actives[e.Vertex.Digest()]; ok {
 		st.mu.Lock()
 		if st.op != nil && st.op.op != nil {
@@ -792,9 +857,10 @@ func (j *Job) walkProvenance(ctx context.Context, e Edge, f func(ProvenanceProvi
 				}
 			}
 		}
+		inputs = st.vtx.Inputs()
 		st.mu.Unlock()
 	}
-	for _, inp := range e.Vertex.Inputs() {
+	for _, inp := range inputs {
 		if err := j.walkProvenance(ctx, inp, f, visited); err != nil {
 			return err
 		}
@@ -863,6 +929,21 @@ func (j *Job) RegisterCompleteTime() time.Time {
 
 func (j *Job) UniqueID() string {
 	return j.uniqueID
+}
+
+func (j *Job) CompatibilityVersion() (int, error) {
+	version := compat.CompatibilityVersionCurrent
+	if err := j.EachValue(context.TODO(), compat.JobValueKey, func(v any) error {
+		parsed, ok := v.(int)
+		if !ok {
+			return errors.Errorf("invalid compatibility version %T", v)
+		}
+		version = parsed
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 func (j *Job) InContext(ctx context.Context, f func(context.Context, JobContext) error) error {
@@ -990,7 +1071,6 @@ func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, fun
 // evaluated, hence "slow" cache.
 func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessFunc, f ResultBasedCacheFunc, res Result) (dgst digest.Digest, err error) {
 	defer func() {
-		err = WrapSlowCache(err, index, NewSharedResult(res).Clone())
 		err = errdefs.WithOp(err, s.st.vtx.Sys(), s.st.vtx.Options().Description)
 		err = errdefs.WrapVertex(err, s.st.origDigest)
 	}()
@@ -1051,6 +1131,10 @@ func (s *sharedOp) CalcSlowCache(ctx context.Context, index Index, p PreprocessF
 		if complete {
 			if err == nil {
 				s.slowCacheRes[index] = key
+			} else if errResult := s.st.cloneUntilRelease(res); errResult != nil {
+				// The error is memoized, so the input is cloned only once and
+				// kept available until the solver state is discarded.
+				err = WrapSlowCache(err, index, errResult)
 			}
 			s.slowCacheErr[index] = err
 		}
@@ -1100,6 +1184,12 @@ func (s *sharedOp) CacheMap(ctx context.Context, index int) (resp *cacheMapResp,
 			}()
 		}
 		res, done, err := op.CacheMap(ctx, s.st, len(s.cacheRes))
+		if err == nil && res == nil {
+			err = errors.New("invalid nil cache map")
+		}
+		if err == nil && len(res.Deps) != len(s.st.vtx.Inputs()) {
+			err = errors.Errorf("invalid cache map: expected dependency count %d, got %d", len(s.st.vtx.Inputs()), len(res.Deps))
+		}
 		complete := true
 		if err != nil {
 			select {
@@ -1204,6 +1294,7 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 
 				s.execRes = &execRes{execRes: wrapShared(res), execExporters: subExporters}
 			}
+			s.st.cloneErrorRefs(err)
 			s.execErr = err
 		}
 		if s.execRes == nil || err != nil {
@@ -1222,12 +1313,30 @@ func (s *sharedOp) Exec(ctx context.Context, inputs []Result) (outputs []Result,
 func (s *sharedOp) getOp() (Op, error) {
 	s.opOnce.Do(func() {
 		s.subBuilder = s.st.builder()
-		s.op, s.err = s.resolver(s.st.vtx, s.subBuilder)
+		s.st.mu.RLock()
+		metadata := s.st.metadata
+		s.st.mu.RUnlock()
+		v := s.st.vtx
+		if metadata != nil {
+			v = &vertexWithMetadata{Vertex: v, metadata: metadata}
+		}
+		s.op, s.err = s.resolver(v, s.subBuilder)
 	})
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.op, nil
+}
+
+type vertexWithMetadata struct {
+	Vertex
+	metadata VertexMetadata
+}
+
+func (v *vertexWithMetadata) Options() VertexOptions {
+	opts := v.Vertex.Options()
+	opts.Metadata = v.metadata
+	return opts
 }
 
 func (s *sharedOp) release() {
@@ -1305,7 +1414,10 @@ func notifyStarted(ctx context.Context, v *client.Vertex, cached bool) func(err 
 
 type SlowCacheError struct {
 	error
-	Index  Index
+	Index Index
+	// Result is owned by the solver state that produced the error. Callers
+	// must not release it and need to Clone it while the job is still active
+	// if they want to keep a reference.
 	Result Result
 }
 
@@ -1326,6 +1438,20 @@ func WrapSlowCache(err error, index Index, res Result) error {
 		return nil
 	}
 	return &SlowCacheError{Index: index, Result: res, error: err}
+}
+
+// cloneErrorRefs retains a cached error's refs until the state is released.
+func (s *state) cloneErrorRefs(err error) {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if re, ok := err.(interface {
+			EachRef(func(Result) error) error
+		}); ok {
+			re.EachRef(func(r Result) error {
+				s.cloneUntilRelease(r)
+				return nil
+			})
+		}
+	}
 }
 
 func releaseError(err error) {

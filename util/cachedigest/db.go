@@ -5,18 +5,20 @@ import (
 	"crypto/sha256"
 	"sync"
 
+	"github.com/moby/buildkit/util/db"
+	"github.com/moby/buildkit/util/db/boltutil"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"go.etcd.io/bbolt"
+	bolt "go.etcd.io/bbolt"
 )
 
-var ErrInvalidEncoding = errors.Errorf("invalid encoding")
-var ErrNotFound = errors.Errorf("not found")
+var ErrInvalidEncoding = errors.New("invalid encoding")
+var ErrNotFound = errors.New("not found")
 
 const bucketName = "byhash"
 
 type DB struct {
-	db *bbolt.DB
+	db db.DB
 	wg sync.WaitGroup
 }
 
@@ -31,7 +33,10 @@ func GetDefaultDB() *DB {
 }
 
 func NewDB(path string) (*DB, error) {
-	db, err := bbolt.Open(path, 0600, nil)
+	db, err := boltutil.SafeOpen(path, 0600, &bolt.Options{
+		FreelistType:   bolt.FreelistMapType,
+		NoFreelistSync: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +79,7 @@ func (d *DB) saveFrames(key string, frames []Frame) {
 			// Optionally log error
 			return
 		}
-		_ = d.db.Update(func(tx *bbolt.Tx) error {
+		_ = d.db.Update(func(tx *bolt.Tx) error {
 			b, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 			if err != nil {
 				return err
@@ -94,7 +99,7 @@ func (d *DB) Get(ctx context.Context, dgst string) (Type, []Frame, error) {
 	}
 	var typ Type
 	var resultFrames []Frame
-	err = d.db.View(func(tx *bbolt.Tx) error {
+	err = d.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(bucketName))
 		if b == nil {
 			return errors.WithStack(ErrNotFound)
@@ -127,7 +132,7 @@ func (d *DB) All(ctx context.Context, cb func(key string, typ Type, frames []Fra
 	if d.db == nil {
 		return nil
 	}
-	return d.db.View(func(tx *bbolt.Tx) error {
+	return d.db.View(func(tx *bolt.Tx) error {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)

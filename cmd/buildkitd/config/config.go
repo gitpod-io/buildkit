@@ -2,12 +2,16 @@ package config
 
 import (
 	"github.com/moby/buildkit/cache/remotecache/gha/ghatypes"
+	"github.com/moby/buildkit/util/db/compaction"
 	resolverconfig "github.com/moby/buildkit/util/resolver/config"
 )
 
 // Config provides containerd configuration data for the server
 type Config struct {
+	// Deprecated: Use Log.Level with "debug" set instead.
 	Debug bool `toml:"debug"`
+
+	// Deprecated: Use Log.Level with "trace" set instead.
 	Trace bool `toml:"trace"`
 
 	// Root is the path to a directory where buildkit will store persistent data
@@ -15,6 +19,9 @@ type Config struct {
 
 	// Entitlements e.g. security.insecure, network.host, device
 	Entitlements []string `toml:"insecure-entitlements"`
+
+	// ProxyNetwork enables proxy network enforcement for all builds.
+	ProxyNetwork bool `toml:"proxyNetwork"`
 
 	// LogFormat is the format of the logs. It can be "json" or "text".
 	Log LogConfig `toml:"log"`
@@ -48,7 +55,53 @@ type Config struct {
 	// that is added to the provenance of builds. Defaults to /etc/buildkit/provenance.d/ ,
 	ProvenanceEnvDir string `toml:"provenanceEnvDir"`
 
-	Cache CacheConfig `toml:"cache"`
+	Cache      CacheConfig      `toml:"cache"`
+	Compaction CompactionConfig `toml:"compaction"`
+}
+
+type CompactionConfig struct {
+	Enabled                bool      `toml:"enabled"`
+	IdleTimeout            *Duration `toml:"idleTimeout"`
+	MaxRetry               *int      `toml:"maxRetry"`
+	WritesPerCheck         *uint64   `toml:"writesPerCheck"`
+	SizeWatermark          *int64    `toml:"sizeWatermark"`
+	SizeGrowthPercent      *int64    `toml:"sizeGrowthPercent"`
+	MinReclaimBytes        *int64    `toml:"minReclaimBytes"`
+	MinReclaimPercent      *int64    `toml:"minReclaimPercent"`
+	MinReclaimPercentFloor *int64    `toml:"minReclaimPercentFloor"`
+}
+
+func (c CompactionConfig) Policy() (compaction.Config, error) {
+	policy := compaction.DefaultConfig()
+	policy.ManualOnly = !c.Enabled
+	if c.IdleTimeout != nil {
+		policy.IdleTimeout = c.IdleTimeout.Duration
+	}
+	if c.MaxRetry != nil {
+		policy.MaxRetry = *c.MaxRetry
+	}
+	if c.WritesPerCheck != nil {
+		policy.WritesPerCheck = *c.WritesPerCheck
+	}
+	if c.SizeWatermark != nil {
+		policy.SizeWatermark = *c.SizeWatermark
+	}
+	if c.SizeGrowthPercent != nil {
+		policy.SizeGrowthPercent = *c.SizeGrowthPercent
+	}
+	if c.MinReclaimBytes != nil {
+		policy.MinReclaimBytes = *c.MinReclaimBytes
+	}
+	if c.MinReclaimPercent != nil {
+		policy.MinReclaimPercent = *c.MinReclaimPercent
+		if c.MinReclaimPercentFloor == nil {
+			policy.MinReclaimPercentFloor = min(policy.MinReclaimPercentFloor, policy.MinReclaimPercent)
+		}
+	}
+	if c.MinReclaimPercentFloor != nil {
+		policy.MinReclaimPercentFloor = *c.MinReclaimPercentFloor
+	}
+	return policy, policy.Validate()
 }
 
 type CacheConfig struct {
@@ -59,10 +112,20 @@ type SystemConfig struct {
 	// PlatformCacheMaxAge controls how often supported platforms
 	// are refreshed by rescanning the system.
 	PlatformsCacheMaxAge *Duration `toml:"platformsCacheMaxAge"`
+
+	// MaxRegistryConcurrency sets the maximum number of concurrent
+	// connections per registry.
+	MaxRegistryConcurrency *int `toml:"maxRegistryConcurrency"`
+
+	// SessionAuthTimeout is the timeout for daemon-side session auth
+	// round-trips with the buildx client session. Defaults to 60 seconds.
+	// A value of zero or less disables the deadline entirely.
+	SessionAuthTimeout *Duration `toml:"sessionAuthTimeout"`
 }
 
 type LogConfig struct {
 	Format string `toml:"format"`
+	Level  string `toml:"level"`
 }
 
 type GRPCConfig struct {
@@ -168,6 +231,9 @@ type ContainerdConfig struct {
 	DefaultCgroupParent string `toml:"defaultCgroupParent"`
 
 	Rootless bool `toml:"rootless"`
+
+	// HyperVIsolation enables Hyper-V isolation for Windows containers.
+	HyperVIsolation bool `toml:"hypervIsolation"`
 }
 
 type ContainerdRuntime struct {
@@ -210,7 +276,7 @@ type DNSConfig struct {
 
 type HistoryConfig struct {
 	MaxAge     Duration `toml:"maxAge"`
-	MaxEntries int64    `toml:"maxEntries"`
+	MaxEntries *int64   `toml:"maxEntries"`
 }
 
 type DockerfileFrontendConfig struct {

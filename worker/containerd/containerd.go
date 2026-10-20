@@ -17,6 +17,7 @@ import (
 	"github.com/moby/buildkit/executor/oci"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
+	"github.com/moby/buildkit/util/db/compaction"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/util/winlayers"
@@ -30,6 +31,7 @@ import (
 type RuntimeInfo = containerdexecutor.RuntimeInfo
 
 type WorkerOptions struct {
+	Compaction      []compaction.Config
 	Root            string
 	Address         string
 	SnapshotterName string
@@ -45,6 +47,7 @@ type WorkerOptions struct {
 	TraceSocket     string
 	Runtime         *RuntimeInfo
 	CDIManager      *cdidevices.Manager
+	HyperVIsolation bool
 }
 
 // NewWorkerOpt creates a WorkerOpt.
@@ -79,7 +82,7 @@ func newContainerd(client *ctd.Client, workerOpts WorkerOptions) (base.WorkerOpt
 		return base.WorkerOpt{}, err
 	}
 
-	np, npResolvedMode, err := netproviders.Providers(workerOpts.NetworkOpt)
+	np, proxyProvider, npResolvedMode, err := netproviders.Providers(workerOpts.NetworkOpt)
 	if err != nil {
 		return base.WorkerOpt{}, err
 	}
@@ -134,7 +137,7 @@ func newContainerd(client *ctd.Client, workerOpts WorkerOptions) (base.WorkerOpt
 		}
 	}
 
-	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"))
+	md, err := metadata.NewStore(filepath.Join(root, "metadata_v2.db"), workerOpts.Compaction...)
 	if err != nil {
 		return base.WorkerOpt{}, err
 	}
@@ -151,6 +154,8 @@ func newContainerd(client *ctd.Client, workerOpts WorkerOptions) (base.WorkerOpt
 		Runtime:          workerOpts.Runtime,
 		CDIManager:       workerOpts.CDIManager,
 		NetworkProviders: np,
+		ProxyProvider:    proxyProvider,
+		HyperVIsolation:  workerOpts.HyperVIsolation,
 	}
 
 	opt := base.WorkerOpt{
@@ -159,6 +164,7 @@ func newContainerd(client *ctd.Client, workerOpts WorkerOptions) (base.WorkerOpt
 		Labels:           xlabels,
 		MetadataStore:    md,
 		NetworkProviders: np,
+		ProxyProvider:    proxyProvider,
 		Executor:         containerdexecutor.New(executorOpts),
 		Snapshotter:      containerdsnapshot.NewSnapshotter(workerOpts.SnapshotterName, client.SnapshotService(workerOpts.SnapshotterName), workerOpts.Namespace, nil),
 		ContentStore:     cs,

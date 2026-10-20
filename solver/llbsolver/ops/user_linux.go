@@ -1,17 +1,21 @@
 package ops
 
 import (
+	"io"
 	"os"
 	"syscall"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/openfile"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
 	copy "github.com/tonistiigi/fsutil/copy"
 )
+
+const maxUserFileBytes = 10 << 20
 
 func getReadUserFn(_ worker.Worker) func(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error) {
 	return readUser
@@ -26,7 +30,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 		switch u := chopt.User.User.(type) {
 		case *pb.UserOpt_ByName:
 			if mu == nil {
-				return nil, errors.Errorf("invalid missing user mount")
+				return nil, errors.New("invalid missing user mount")
 			}
 
 			lm := snapshot.LocalMounter(mu)
@@ -41,12 +45,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 				return nil, err
 			}
 
-			passwdPath, err = fs.RootPath(dir, passwdPath)
-			if err != nil {
-				return nil, err
-			}
-
-			ufile, err := os.Open(passwdPath)
+			ufile, err := openUserFile(dir, passwdPath)
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 				// Couldn't open the file. Considering this case as not finding the user in the file.
 				break
@@ -77,7 +76,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 		switch u := chopt.Group.User.(type) {
 		case *pb.UserOpt_ByName:
 			if mg == nil {
-				return nil, errors.Errorf("invalid missing group mount")
+				return nil, errors.New("invalid missing group mount")
 			}
 
 			lm := snapshot.LocalMounter(mg)
@@ -92,12 +91,7 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 				return nil, err
 			}
 
-			groupPath, err = fs.RootPath(dir, groupPath)
-			if err != nil {
-				return nil, err
-			}
-
-			gfile, err := os.Open(groupPath)
+			gfile, err := openUserFile(dir, groupPath)
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 				// Couldn't open the file. Considering this case as not finding the group in the file.
 				break
@@ -123,4 +117,45 @@ func readUser(chopt *pb.ChownOpt, mu, mg snapshot.Mountable) (*copy.User, error)
 	}
 
 	return &us, nil
+}
+
+func openUserFile(root, orig string) (_ io.ReadCloser, retErr error) {
+	// paths below are daemon-side locations, report the path as the build
+	// asked for it
+	defer func() {
+		var pathErr *os.PathError
+		if errors.As(retErr, &pathErr) {
+			pathErr.Path = orig
+		}
+	}()
+
+	p, err := fs.RootPath(root, orig)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	f, err := openfile.Regular(p)
+	if err != nil {
+		return nil, err
+	}
+
+	return &limitedReadCloser{
+		ReadCloser: f,
+		r:          &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
+		name:       orig,
+	}, nil
+}
+
+type limitedReadCloser struct {
+	io.ReadCloser
+	r    *io.LimitedReader
+	name string
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.r.N == 0 {
+		return n, errors.Errorf("%q exceeds %d bytes", l.name, maxUserFileBytes)
+	}
+	return n, err
 }

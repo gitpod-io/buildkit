@@ -44,11 +44,8 @@ jobs:
       includes: ${{ steps.set.outputs.includes }}
     steps:
       -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-      -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           version: ${{ env.SETUP_BUILDX_VERSION }}
           driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
@@ -56,7 +53,7 @@ jobs:
       -
         name: Deps
         run: |
-          npm install js-yaml
+          npm install --no-save js-yaml@5.1.0
       -
         name: Set outputs
         id: set
@@ -88,13 +85,14 @@ jobs:
               core.setOutput('tags', JSON.stringify(matrix));
             });
             await core.group(`Set includes`, async () => {
-              const includes = yaml.load(core.getInput('includes'));
+              const input = core.getInput('includes').trim();
+              const includes = input ? yaml.load(input) : [];
               core.info(JSON.stringify(includes, null, 2));
               core.setOutput('includes', JSON.stringify(includes ?? []));
             });
       -
         name: Build
-        uses: docker/bake-action@a66e1c87e2eca0503c343edf1d208c716d54b8a8 # v7.1.0
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
           targets: integration-tests-base
           set: |
@@ -116,7 +114,7 @@ jobs:
           - containerd
           - containerd-rootless
           - containerd-1.7
-          - containerd-2.1
+          - containerd-2.3
           - containerd-snapshotter-stargz
           - oci
           - oci-rootless
@@ -147,27 +145,27 @@ jobs:
           echo "TESTFLAGS=${testFlags}" >> $GITHUB_ENV
       -
         name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       -
         name: Expose GitHub Runtime
         uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
       -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        name: Set up QEMU # required by TestNamedMultiplatformInputContext, TestMultiPlatformProvenance, etc.
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           version: ${{ env.SETUP_BUILDX_VERSION }}
           driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
           buildkitd-flags: --debug
       -
         name: Build test image
-        uses: docker/bake-action@a66e1c87e2eca0503c343edf1d208c716d54b8a8 # v7.1.0
+        uses: ./.github/actions/retry-go-network
         with:
-          targets: integration-tests
-          set: |
-            *.cache-from=type=gha,scope=${{ inputs.cache_scope }}
+          command: |
+            docker buildx bake --progress=plain integration-tests \
+              --set '*.cache-from=type=gha,scope=${{ inputs.cache_scope }}'
         env:
           BUILDKITD_TAGS: ${{ matrix.tags }}
           TEST_COVERAGE: 1
@@ -185,7 +183,7 @@ jobs:
       -
         name: Send to Codecov
         if: always()
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           directory: ./bin/testreports
           flags: ${{ matrix.codecov_flags }}
@@ -194,7 +192,7 @@ jobs:
       -
         name: Generate annotations
         if: always()
-        uses: crazy-max/.github/.github/actions/gotest-annotations@64a0bfaf6e6bb1c448d6e4c42b11034ee7094f16 # v1.7.1
+        uses: crazy-max/.github/.github/actions/gotest-annotations@f91220cba053bd54299ba645a599ee8ed436f222 # v1.11.0
         with:
           directory: ./bin/testreports
       -

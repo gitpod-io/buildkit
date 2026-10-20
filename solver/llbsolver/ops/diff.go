@@ -23,7 +23,10 @@ type diffOp struct {
 }
 
 func NewDiffOp(v solver.Vertex, op *pb.Op_Diff, w worker.Worker) (solver.Op, error) {
-	if err := opsutils.Validate(&pb.Op{Op: op}); err != nil {
+	if err := opsutils.Validate(&pb.Op{
+		Inputs: make([]*pb.Input, len(v.Inputs())),
+		Op:     op,
+	}); err != nil {
 		return nil, err
 	}
 	return &diffOp{
@@ -70,6 +73,9 @@ func (d *diffOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 
 	var lowerRef cache.ImmutableRef
 	if d.op.Lower.Input != int64(pb.Empty) {
+		if curInput >= len(inputs) {
+			return nil, errors.Errorf("invalid lower input index %d for diff op with %d inputs", curInput, len(inputs))
+		}
 		if lowerInp := inputs[curInput]; lowerInp != nil {
 			wref, ok := lowerInp.Sys().(*worker.WorkerRef)
 			if !ok {
@@ -84,6 +90,9 @@ func (d *diffOp) Exec(ctx context.Context, jobCtx solver.JobContext, inputs []so
 
 	var upperRef cache.ImmutableRef
 	if d.op.Upper.Input != int64(pb.Empty) {
+		if curInput >= len(inputs) {
+			return nil, errors.Errorf("invalid upper input index %d for diff op with %d inputs", curInput, len(inputs))
+		}
 		if upperInp := inputs[curInput]; upperInp != nil {
 			wref, ok := upperInp.Sys().(*worker.WorkerRef)
 			if !ok {

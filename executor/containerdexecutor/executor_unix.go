@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 
 	ctd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -46,8 +47,8 @@ func getUserSpec(user, rootfsPath string) (specs.User, error) {
 func (w *containerdExecutor) prepareExecutionEnv(ctx context.Context, rootMount executor.Mount, mounts []executor.Mount, meta executor.Meta, details *containerState, netMode pb.NetMode) (string, string, func(), error) {
 	var releasers []func()
 	releaseAll := func() {
-		for i := len(releasers) - 1; i >= 0; i-- {
-			releasers[i]()
+		for _, release := range slices.Backward(releasers) {
+			release()
 		}
 	}
 
@@ -133,8 +134,8 @@ func (w *containerdExecutor) ensureCWD(details *containerState, meta executor.Me
 func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, hostsFile string, namespace network.Namespace, mounts []executor.Mount, meta executor.Meta, details *containerState) (*specs.Spec, func(), error) {
 	var releasers []func()
 	releaseAll := func() {
-		for i := len(releasers) - 1; i >= 0; i-- {
-			releasers[i]()
+		for _, release := range slices.Backward(releasers) {
+			release()
 		}
 	}
 
@@ -158,10 +159,15 @@ func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, 
 	releasers = append(releasers, cleanup)
 	spec.Process.Terminal = meta.Tty
 	if w.rootless {
-		if err := rootlessspecconv.ToRootless(spec); err != nil {
+		removedMounts, err := rootlessspecconv.ToRootless(spec)
+		if err != nil {
 			releaseAll()
 			return nil, nil, err
 		}
+		// The runtime no longer sets these mounts up, but a rootful build still gets
+		// their mount points left in the rootfs. The caller recreates them once the
+		// container is gone. moby/buildkit#6686
+		details.removedMounts = removedMounts
 	}
 	return spec, releaseAll, nil
 }

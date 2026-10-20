@@ -15,7 +15,9 @@ func TestMarsalBuildDefinitionSLSA1(t *testing.T) {
 	"request": {}
 },
 "internalParameters": {
-	"builderPlatform": "linux/amd64",
+		"builderPlatform": "linux/amd64",
+		"targetPlatform": "linux/arm64",
+		"dockerfileVersion": "1.24.0-dev",
 		"foo": "bar",
 		"abc": 123,
 		"def": {"one": 1}
@@ -28,6 +30,8 @@ func TestMarsalBuildDefinitionSLSA1(t *testing.T) {
 
 	require.Equal(t, "btype1", def.BuildType)
 	require.Equal(t, "linux/amd64", def.InternalParameters.BuilderPlatform)
+	require.Equal(t, "linux/arm64", def.InternalParameters.TargetPlatform)
+	require.Equal(t, "1.24.0-dev", def.InternalParameters.DockerfileVersion)
 	require.Equal(t, "bar", def.InternalParameters.ProvenanceCustomEnv["foo"])
 	require.InEpsilon(t, float64(123), def.InternalParameters.ProvenanceCustomEnv["abc"], 0.001)
 	require.Equal(t, map[string]any{"one": float64(1)}, def.InternalParameters.ProvenanceCustomEnv["def"])
@@ -36,6 +40,19 @@ func TestMarsalBuildDefinitionSLSA1(t *testing.T) {
 	require.NoError(t, err)
 
 	require.JSONEq(t, inp, string(out))
+}
+
+func TestTargetPlatformNotOverriddenByCustomEnv(t *testing.T) {
+	params := ProvenanceInternalParametersSLSA1{
+		TargetPlatform: "linux/arm64",
+		ProvenanceCustomEnv: ProvenanceCustomEnv{
+			"targetPlatform": "linux/amd64",
+		},
+	}
+
+	dt, err := json.Marshal(params)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"builderPlatform":"","targetPlatform":"linux/arm64"}`, string(dt))
 }
 
 func TestMarshalInvocation(t *testing.T) {
@@ -48,6 +65,7 @@ func TestMarshalInvocation(t *testing.T) {
 	},
 	"environment": {
 		"platform": "linux/amd64",
+		"dockerfileVersion": "1.24.0-dev",
 		"buildkit": "v0.10.3",
 		"custom": {
 			"foo": "bar"
@@ -63,6 +81,7 @@ func TestMarshalInvocation(t *testing.T) {
 	require.Equal(t, "git+https://github.com/example/repo.git", inv.ConfigSource.URI)
 	require.Equal(t, "dockerfile.v0", inv.Parameters.Frontend)
 	require.Equal(t, "linux/amd64", inv.Environment.Platform)
+	require.Equal(t, "1.24.0-dev", inv.Environment.DockerfileVersion)
 	require.Equal(t, "v0.10.3", inv.Environment.ProvenanceCustomEnv["buildkit"])
 	require.Equal(t, "bar", inv.Environment.ProvenanceCustomEnv["custom"].(map[string]any)["foo"])
 	require.Equal(t, []any{float64(1), float64(2), float64(3)}, inv.Environment.ProvenanceCustomEnv["bar"])

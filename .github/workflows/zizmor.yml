@@ -20,7 +20,8 @@ on:
 
 jobs:
   run:
-    uses: crazy-max/.github/.github/workflows/zizmor.yml@64a0bfaf6e6bb1c448d6e4c42b11034ee7094f16 # v1.7.1
+    if: ${{ github.repository == 'moby/buildkit' }}
+    uses: crazy-max/.github/.github/workflows/zizmor.yml@f91220cba053bd54299ba645a599ee8ed436f222 # v1.11.0
     permissions:
       contents: read
       security-events: write

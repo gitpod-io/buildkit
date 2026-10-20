@@ -70,7 +70,6 @@ func (e *imageExporter) Resolve(ctx context.Context, id int, opt map[string]stri
 			RefCfg: cacheconfig.RefConfig{
 				Compression: compression.New(compression.Default),
 			},
-			OCITypes: e.opt.Variant == VariantOCI,
 		},
 	}
 
@@ -133,7 +132,7 @@ func (e *imageExporterInstance) Config() *exporter.Config {
 
 func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source, buildInfo exporter.ExportBuildInfo) (_ map[string]string, _ exporter.FinalizeFunc, descref exporter.DescriptorReference, err error) {
 	if e.opt.Variant == VariantDocker && len(src.Refs) > 0 {
-		return nil, nil, nil, errors.Errorf("docker exporter does not currently support exporting manifest lists")
+		return nil, nil, nil, errors.New("docker exporter does not currently support exporting manifest lists")
 	}
 
 	src = src.Clone()
@@ -148,6 +147,11 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 		return nil, nil, nil, err
 	}
 	opts.Annotations = opts.Annotations.Merge(as)
+	opts.SetOCITypesDefault(e.defaultOCITypes(buildInfo.CompatibilityVersion, src))
+	opts.SetOCIArtifactDefault(containerimage.DefaultOCIArtifact(buildInfo.CompatibilityVersion, &opts))
+	if err := opts.Validate(); err != nil {
+		return nil, nil, nil, err
+	}
 
 	ctx, done, err := leaseutil.WithLease(ctx, e.opt.LeaseManager, leaseutil.MakeTemporary)
 	if err != nil {
@@ -159,7 +163,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 		}
 	}()
 
-	desc, err := e.opt.ImageWriter.Commit(ctx, src, buildInfo.SessionID, buildInfo.InlineCache, &opts)
+	desc, _, err := e.opt.ImageWriter.Commit(ctx, src, buildInfo.SessionID, buildInfo.InlineCache, &opts, buildInfo.CompatibilityVersion, e.Type())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -293,6 +297,13 @@ func (e *imageExporterInstance) Export(ctx context.Context, src *exporter.Source
 	}
 
 	return resp, nil, nil, nil
+}
+
+func (e *imageExporterInstance) defaultOCITypes(compatibilityVersion int, src *exporter.Source) bool {
+	if e.opt.Variant == VariantOCI {
+		return true
+	}
+	return containerimage.DefaultOCITypes(compatibilityVersion, src)
 }
 
 func normalizedNames(name string) ([]string, error) {

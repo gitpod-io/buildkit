@@ -52,6 +52,9 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 	var copyOpt []llb.CopyOption
 
 	if cfg.chown != "" {
+		if cfg.link && chownByName(cfg.chown) {
+			return errors.Errorf("--chown=%s: user and group names can't be resolved when used with --link, use numeric uid[:gid] instead", cfg.chown)
+		}
 		copyOpt = append(copyOpt, llb.WithUser(cfg.chown))
 	}
 
@@ -138,6 +141,9 @@ func dispatchCopy(d *dispatchState, cfg copyConfig) error {
 			gitOptions := []llb.GitOption{
 				llb.WithCustomName(pgName),
 				llb.GitRef(gitRef.Ref),
+			}
+			if cfg.opt.gitAdvice {
+				gitOptions = append(gitOptions, llb.GitAdvice(true))
 			}
 			if cfg.keepGitDir != nil && gitRef.KeepGitDir != nil {
 				if *cfg.keepGitDir != *gitRef.KeepGitDir {
@@ -364,6 +370,18 @@ func isGitSource(src string) bool {
 		return true
 	}
 	return false
+}
+
+// chownByName reports whether chown refers to a user or group by name rather
+// than by numeric ID. Names are resolved from /etc/passwd and /etc/group of the
+// FileOp base, which is empty when copying into a linked layer, so --link
+// rejects them regardless of how the current worker implements the copy.
+func chownByName(chown string) bool {
+	co, ok := llb.WithUser(chown).(llb.ChownOpt)
+	if !ok {
+		return false
+	}
+	return (co.User != nil && co.User.Name != "") || (co.Group != nil && co.Group.Name != "")
 }
 
 func containsWildcards(name string) bool {

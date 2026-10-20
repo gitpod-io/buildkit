@@ -1,11 +1,11 @@
 package cacheimport
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/moby/buildkit/solver"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -45,7 +45,7 @@ func TestSimpleMarshal(t *testing.T) {
 
 	addRecords()
 
-	cfg, _, err := cc.Marshal(context.TODO())
+	cfg, _, err := cc.Marshal(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, 2, len(cfg.Layers))
@@ -77,7 +77,7 @@ func TestSimpleMarshal(t *testing.T) {
 	// adding same info again doesn't produce anything extra
 	addRecords()
 
-	cfg2, descPairs, err := cc.Marshal(context.TODO())
+	cfg2, descPairs, err := cc.Marshal(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, cfg, cfg2)
@@ -90,7 +90,7 @@ func TestSimpleMarshal(t *testing.T) {
 	err = Parse(dt, descPairs, newChains)
 	require.NoError(t, err)
 
-	cfg3, _, err := cc.Marshal(context.TODO())
+	cfg3, _, err := cc.Marshal(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, cfg, cfg3)
 
@@ -98,11 +98,65 @@ func TestSimpleMarshal(t *testing.T) {
 	_, ok, err := cc.Add(outputKey(dgst("bay"), 0), nil, nil)
 	require.NoError(t, err)
 	require.True(t, ok)
-	cfg, _, err = cc.Marshal(context.TODO())
+	cfg, _, err = cc.Marshal(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, 2, len(cfg.Layers))
 	require.Equal(t, 4, len(cfg.Records))
+}
+
+func TestMarshalLayerMediaTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		descs    []ocispecs.Descriptor
+		expected map[digest.Digest]string
+	}{
+		{
+			name: "docker",
+			descs: []ocispecs.Descriptor{
+				{Digest: dgst("d0"), MediaType: images.MediaTypeDockerSchema2Layer},
+				{Digest: dgst("d1"), MediaType: images.MediaTypeDockerSchema2LayerGzip},
+				{Digest: dgst("d2"), MediaType: images.MediaTypeDockerSchema2LayerZstd},
+			},
+			expected: map[digest.Digest]string{
+				dgst("d0"): ocispecs.MediaTypeImageLayer,
+				dgst("d1"): ocispecs.MediaTypeImageLayerGzip,
+				dgst("d2"): ocispecs.MediaTypeImageLayerZstd,
+			},
+		},
+		{
+			name: "oci",
+			descs: []ocispecs.Descriptor{
+				{Digest: dgst("d0"), MediaType: ocispecs.MediaTypeImageLayer},
+				{Digest: dgst("d1"), MediaType: ocispecs.MediaTypeImageLayerGzip},
+				{Digest: dgst("d2"), MediaType: ocispecs.MediaTypeImageLayerZstd},
+			},
+			expected: map[digest.Digest]string{
+				dgst("d0"): ocispecs.MediaTypeImageLayer,
+				dgst("d1"): ocispecs.MediaTypeImageLayerGzip,
+				dgst("d2"): ocispecs.MediaTypeImageLayerZstd,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cc := NewCacheChains()
+			_, ok, err := cc.Add(outputKey(dgst("foo"), 0), nil, []solver.CacheExportResult{{
+				CreatedAt: time.Now(),
+				Result: &solver.Remote{
+					Descriptors: tc.descs,
+				},
+			}})
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			_, descPairs, err := cc.Marshal(t.Context())
+			require.NoError(t, err)
+
+			for dgst, mediaType := range tc.expected {
+				require.Equal(t, mediaType, descPairs[dgst].Descriptor.MediaType)
+			}
+		})
+	}
 }
 
 func dgst(s string) digest.Digest {

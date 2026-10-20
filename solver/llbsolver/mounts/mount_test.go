@@ -43,10 +43,15 @@ type cmOut struct {
 	cs      content.Store
 }
 
+func TestMountableSSHRequiresOptions(t *testing.T) {
+	_, err := (&MountManager{}).MountableSSH(t.Context(), &pb.Mount{MountType: pb.MountType_SSH}, nil)
+	require.ErrorContains(t, err, "invalid SSH mount options")
+}
+
 func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
-		return nil, errors.Errorf("namespace required for test")
+		return nil, errors.New("namespace required for test")
 	}
 
 	if opt.snapshotterName == "" {
@@ -84,7 +89,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, e
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		opt.snapshotterName: opt.snapshotter,
 	})
-	if err := mdb.Init(context.TODO()); err != nil {
+	if err := mdb.Init(t.Context()); err != nil {
 		return nil, err
 	}
 
@@ -137,7 +142,7 @@ func newRefGetter(m cache.Manager, shared *cacheRefs) *cacheRefGetter {
 
 func TestCacheMountPrivateRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -180,7 +185,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 	require.NotEqual(t, ref.ID(), ref4.ID())
 
 	// releasing one of two refs still keeps first ID private
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 
 	ref5, err := g3.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_PRIVATE)
 	require.NoError(t, err)
@@ -188,7 +193,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 	require.NotEqual(t, ref4.ID(), ref5.ID())
 
 	// releasing all refs releases ID to be reused
-	ref3.Release(context.TODO())
+	ref3.Release(t.Context())
 
 	ref5, err = g4.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_PRIVATE)
 	require.NoError(t, err)
@@ -203,7 +208,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 
 func TestCacheMountSharedRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -252,7 +257,7 @@ func TestCacheMountSharedRefs(t *testing.T) {
 
 func TestCacheMountLockedRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -314,7 +319,7 @@ func TestCacheMountLockedRefs(t *testing.T) {
 // moby/buildkit#1322
 func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 	// not parallel
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -348,10 +353,10 @@ func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 		cacheRefReleaseHijack = nil
 		cacheRefCloneHijack = nil
 	}()
-	eg, _ := errgroup.WithContext(context.TODO())
+	eg, _ := errgroup.WithContext(t.Context())
 
 	eg.Go(func() error {
-		return ref.Release(context.TODO())
+		return ref.Release(t.Context())
 	})
 	eg.Go(func() error {
 		_, err := g2.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_SHARED)

@@ -2,6 +2,7 @@ package containerdexecutor
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,6 +34,7 @@ type containerdExecutor struct {
 	client           *ctd.Client
 	root             string
 	networkProviders map[pb.NetMode]network.Provider
+	proxyProvider    network.ProxyProvider
 	cgroupParent     string
 	dnsConfig        *oci.DNSConfig
 	running          map[string]*containerState
@@ -70,6 +72,7 @@ type ExecutorOptions struct {
 	Root             string
 	CgroupParent     string
 	NetworkProviders map[pb.NetMode]network.Provider
+	ProxyProvider    network.ProxyProvider
 	DNSConfig        *oci.DNSConfig
 	ApparmorProfile  string
 	Selinux          bool
@@ -90,6 +93,7 @@ func New(executorOpts ExecutorOptions) executor.Executor {
 		client:           executorOpts.Client,
 		root:             executorOpts.Root,
 		networkProviders: executorOpts.NetworkProviders,
+		proxyProvider:    executorOpts.ProxyProvider,
 		cgroupParent:     executorOpts.CgroupParent,
 		dnsConfig:        executorOpts.DNSConfig,
 		running:          make(map[string]*containerState),
@@ -111,6 +115,9 @@ type containerState struct {
 	// On Windows we need to use the root mounts to achieve the same thing that Linux does
 	// with rootfsPath. So we save both in details.
 	rootMounts []mount.Mount
+	// Destinations of the mounts that the rootless spec conversion removed, whose mount
+	// points have to be recreated after the container is gone.
+	removedMounts []string
 }
 
 func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (rec resourcestypes.Recorder, err error) {
@@ -147,9 +154,22 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		bklog.G(ctx).Info("enabling HostNetworking")
 	}
 
-	provider, ok := w.networkProviders[meta.NetMode]
-	if !ok {
-		return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+	proxyConfig := meta.Proxy
+	var provider network.Provider
+	if proxyConfig == nil {
+		var ok bool
+		provider, ok = w.networkProviders[meta.NetMode]
+		if !ok {
+			return nil, errors.Errorf("unknown network mode %s", meta.NetMode)
+		}
+	} else if w.proxyProvider == nil {
+		return nil, errors.New("proxy network provider is not available")
+	} else {
+		proxyConfig = &network.ProxyConfig{
+			Policy:     proxyConfig.Policy,
+			Capture:    proxyConfig.Capture,
+			EgressMode: meta.NetMode,
+		}
 	}
 
 	resolvConf, hostsFile, releasers, err := w.prepareExecutionEnv(ctx, root, mounts, meta, details, meta.NetMode)
@@ -165,11 +185,31 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 		return nil, err
 	}
 
-	namespace, err := provider.New(ctx, meta.Hostname)
+	var namespace network.Namespace
+	if proxyConfig != nil {
+		namespace, err = w.proxyProvider.NewProxy(ctx, proxyConfig)
+	} else {
+		namespace, err = provider.New(ctx, meta.Hostname, network.NamespaceOptions{})
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer namespace.Close()
+	if proxyNS, ok := namespace.(network.ProxyNamespace); ok {
+		meta.Env = executor.ReplaceEnv(meta.Env, proxyNS.ProxyEnv())
+		cleanProxyCA, injectErr := executor.InjectProxyCA(details.rootfsPath, proxyNS.ProxyCACert())
+		if injectErr != nil {
+			return nil, injectErr
+		}
+		defer func() {
+			if cleanupErr := cleanProxyCA(); cleanupErr != nil {
+				err = errors.WithStack(stderrors.Join(
+					err,
+					errors.Wrap(cleanupErr, "failed to clean up proxy CA"),
+				))
+			}
+		}()
+	}
 
 	spec, releaseSpec, err := w.createOCISpec(ctx, id, resolvConf, hostsFile, namespace, mounts, meta, details)
 	if err != nil {
@@ -178,6 +218,15 @@ func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.M
 	if releaseSpec != nil {
 		defer releaseSpec()
 	}
+
+	// Recreate the mount points that the rootless spec conversion removed, so that they
+	// are left in the rootfs the way a rootful build leaves them. This executor has no
+	// identity mapping, so they are owned by root. moby/buildkit#6686
+	defer func() {
+		if err == nil {
+			err = executor.CreateMountStubs(details.rootfsPath, details.removedMounts, 0, 0)
+		}
+	}()
 
 	opts := []ctd.NewContainerOpts{
 		ctd.WithSpec(spec),
@@ -286,6 +335,10 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	}
 
 	proc := spec.Process
+	if meta.Proxy != nil && len(meta.Env) > 0 {
+		meta.Env = executor.ReplaceEnv(meta.Env, network.FilterProxyEnv(proc.Env))
+		process.Meta = meta
+	}
 	if meta.User != "" {
 		userSpec, err := getUserSpec(meta.User, details.rootfsPath)
 		if err != nil {
@@ -303,8 +356,8 @@ func (w *containerdExecutor) Exec(ctx context.Context, id string, process execut
 	if meta.Cwd != "" {
 		spec.Process.Cwd = meta.Cwd
 	}
-	if len(process.Meta.Env) > 0 {
-		spec.Process.Env = process.Meta.Env
+	if len(meta.Env) > 0 {
+		proc.Env = meta.Env
 	}
 
 	fixProcessOutput(&process)
@@ -449,7 +502,7 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p ctd.Process, resi
 				cancel(errors.WithStack(context.Canceled))
 			}
 			io.Cancel()
-			return errors.Errorf("failed to kill process on cancel")
+			return errors.New("failed to kill process on cancel")
 		}
 	}
 }

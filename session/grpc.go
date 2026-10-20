@@ -63,14 +63,14 @@ func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
 		conn.Close()
 	}()
 	bklog.G(ctx).Debugf("serving grpc connection")
-	(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: grpcServer})
+	(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: grpcServer}) //nolint:staticcheck // This existing HTTP/2 connection is already established.
 }
 
 func grpcClientConn(ctx context.Context, conn net.Conn, opts map[string][]string) (context.Context, *grpc.ClientConn, error) {
-	var dialCount int64
+	var dialCount atomic.Int64
 	dialer := grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		if c := atomic.AddInt64(&dialCount, 1); c > 1 {
-			return nil, errors.Errorf("only one connection allowed")
+		if c := dialCount.Add(1); c > 1 {
+			return nil, errors.New("only one connection allowed")
 		}
 		return conn, nil
 	})

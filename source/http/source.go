@@ -32,6 +32,7 @@ import (
 	"github.com/moby/buildkit/util/cachedigest"
 	"github.com/moby/buildkit/util/pgpsign"
 	"github.com/moby/buildkit/util/tracing"
+	"github.com/moby/buildkit/util/urlutil"
 	"github.com/moby/buildkit/version"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -323,9 +324,9 @@ func (hs *httpSourceHandler) resolveMetadataRef(ctx context.Context, jobCtx solv
 			}
 			saveResolved := true
 			defer func() {
-				ret := hs.resolved
-				if retErr != nil || !saveResolved {
-					ret = nil
+				var ret any
+				if retErr == nil && saveResolved && hs.resolved != nil {
+					ret = hs.resolved
 				}
 				if err := release(ret); err != nil {
 					bklog.G(ctx).WithError(err).Warn("failed to release resolver cache lock")
@@ -347,7 +348,7 @@ func (hs *httpSourceHandler) resolveMetadataRef(ctx context.Context, jobCtx solv
 				return &hs.resolved.Metadata, nil
 			}
 			if hs.src.Checksum != "" && len(vals) > 0 {
-				return nil, errors.Errorf("digest mismatch for %s: %s (expected: %s)", hs.src.URL, vals[0], hs.src.Checksum)
+				return nil, errors.Errorf("digest mismatch for %s: %s (expected: %s)", urlutil.RedactCredentials(hs.src.URL), vals[0], hs.src.Checksum)
 			}
 		}
 	}
@@ -555,7 +556,7 @@ func (hs *httpSourceHandler) validatePinnedChecksum(got digest.Digest) error {
 	if hs.src.Checksum == "" || got == hs.src.Checksum {
 		return nil
 	}
-	return errors.Errorf("digest mismatch for %s: %s (expected: %s)", hs.src.URL, got, hs.src.Checksum)
+	return errors.Errorf("digest mismatch for %s: %s (expected: %s)", urlutil.RedactCredentials(hs.src.URL), got, hs.src.Checksum)
 }
 
 func validateChecksumRequest(req *MetadataChecksumRequest) error {
@@ -723,7 +724,7 @@ func checksumAlgo(algo MetadataChecksumAlgo) (digest.Algorithm, error) {
 }
 
 func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s session.Group) (ref cache.ImmutableRef, dgst digest.Digest, retErr error) {
-	newRef, err := hs.cache.New(ctx, nil, s, cache.CachePolicyRetain, cache.WithDescription(fmt.Sprintf("http url %s", hs.src.URL)))
+	newRef, err := hs.cache.New(ctx, nil, s, cache.CachePolicyRetain, cache.WithDescription(fmt.Sprintf("http url %s", urlutil.RedactCredentials(hs.src.URL))))
 	if err != nil {
 		return nil, "", err
 	}
@@ -860,34 +861,17 @@ func (hs *httpSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobCont
 			if err != nil {
 				return nil, err
 			}
-			vals, release, err := rc.Lock(uh)
+			refID, err = hs.snapshotRefIDFromResolverCache(rc, uh)
 			if err != nil {
 				return nil, err
-			}
-			for _, v := range vals {
-				v2, ok := v.(*metadataWithRef)
-				if !ok {
-					return nil, errors.Errorf("invalid HTTP resolver cache value: %T", vals[0])
-				}
-				if hs.src.Checksum != "" && v2.Digest != hs.src.Checksum {
-					continue
-				}
-				if v2.refID != "" {
-					hs.resolved = v2
-					refID = v2.refID
-				}
-			}
-			release(nil)
-			if hs.src.Checksum != "" && len(vals) > 0 && refID == "" {
-				return nil, errors.Errorf("digest mismatch for %s: %s (expected: %s)", hs.src.URL, vals[0], hs.src.Checksum)
 			}
 		}
 	}
 
 	if refID != "" {
-		ref, err := hs.cache.Get(ctx, hs.resolved.refID, nil)
+		ref, err := hs.cache.Get(ctx, refID, nil)
 		if err != nil {
-			bklog.G(ctx).WithError(err).Warnf("failed to get HTTP snapshot for ref %s (%s)", hs.resolved.refID, hs.src.URL)
+			bklog.G(ctx).WithError(err).Warnf("failed to get HTTP snapshot for ref %s (%s)", refID, urlutil.RedactCredentials(hs.src.URL))
 		} else {
 			return ref, nil
 		}
@@ -923,6 +907,33 @@ func (hs *httpSourceHandler) Snapshot(ctx context.Context, jobCtx solver.JobCont
 	}
 
 	return ref, nil
+}
+
+func (hs *httpSourceHandler) snapshotRefIDFromResolverCache(rc solver.ResolverCache, uh digest.Digest) (string, error) {
+	vals, release, err := rc.Lock(uh)
+	if err != nil {
+		return "", err
+	}
+	defer release(nil)
+
+	refID := ""
+	for _, v := range vals {
+		v2, ok := v.(*metadataWithRef)
+		if !ok || v2 == nil {
+			return "", errors.Errorf("invalid HTTP resolver cache value: %T", v)
+		}
+		if hs.src.Checksum != "" && v2.Digest != hs.src.Checksum {
+			continue
+		}
+		if v2.refID != "" {
+			hs.resolved = v2
+			refID = v2.refID
+		}
+	}
+	if hs.src.Checksum != "" && len(vals) > 0 && refID == "" {
+		return "", errors.Errorf("digest mismatch for %s: %s (expected: %s)", urlutil.RedactCredentials(hs.src.URL), vals[0], hs.src.Checksum)
+	}
+	return refID, nil
 }
 
 func (hs *httpSourceHandler) newHTTPRequest(ctx context.Context, g session.Group) (*http.Request, error) {

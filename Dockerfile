@@ -1,37 +1,35 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG RUNC_VERSION=v1.3.5
-ARG CONTAINERD_VERSION=v2.2.3
+ARG RUNC_VERSION=v1.5.2
+ARG CONTAINERD_VERSION=v2.4.1
 # CONTAINERD_ALT_VERSION_... defines fallback containerd version for integration tests
-ARG CONTAINERD_ALT_VERSION_21=v2.1.7
-ARG CONTAINERD_ALT_VERSION_17=v1.7.31
+ARG CONTAINERD_ALT_VERSION_23=v2.3.6
+ARG CONTAINERD_ALT_VERSION_17=v1.7.36
 ARG REGISTRY_VERSION=v2.8.3
-ARG ROOTLESSKIT_VERSION=v3.0.0
+ARG ROOTLESSKIT_VERSION=v3.2.0
 ARG CNI_VERSION=v1.9.1
 ARG STARGZ_SNAPSHOTTER_VERSION=v0.18.2
-ARG NERDCTL_VERSION=v2.2.1
+ARG NERDCTL_VERSION=v2.4.0
 ARG DNSNAME_VERSION=v1.3.1
-ARG NYDUS_VERSION=v2.4.0
-ARG MINIO_VERSION=RELEASE.2025-09-07T16-13-09Z
-ARG MINIO_MC_VERSION=RELEASE.2025-08-13T08-35-41Z
-ARG AZURITE_VERSION=3.35.0
+ARG NYDUS_VERSION=v2.4.5
+ARG SILO_VERSION=RELEASE.2026-09-16T00-00-00Z
+ARG AZURITE_VERSION=3.37.0
 ARG GOTESTSUM_VERSION=v1.13.0
-ARG DELVE_VERSION=v1.26.0
-ARG DOCKER_VERSION=29.4
+ARG DELVE_VERSION=v1.27.2
+ARG DOCKER_VERSION=29.8
 ARG DOCKER_CLI_VERSION=${DOCKER_VERSION}
-ARG BUILDX_VERSION=0.31.1
+ARG BUILDX_VERSION=0.37.1
 
 ARG EXPORT_BASE=alpine
 ARG ALPINE_VERSION=3.23
 ARG UBUNTU_VERSION=24.04
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.9
 ARG XX_VERSION=1.9.0
 ARG BUILDKIT_DEBUG
 
-# minio for s3 integration tests
-FROM quay.io/minio/minio:${MINIO_VERSION} AS minio
-FROM quay.io/minio/mc:${MINIO_MC_VERSION} AS minio-mc
+# silo for s3 integration tests
+FROM pgsty/silo:${SILO_VERSION} AS silo
 
 # xx is a helper for cross-compilation
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
@@ -53,6 +51,8 @@ FROM gobuild-base AS runc
 WORKDIR $GOPATH/src/github.com/opencontainers/runc
 ARG RUNC_VERSION
 ADD --keep-git-dir=true "https://github.com/opencontainers/runc.git#$RUNC_VERSION" .
+RUN go get golang.org/x/net@v0.60.0 github.com/moby/sys/user@v0.4.1 github.com/cilium/ebpf@v0.22.0 \
+  && go mod tidy && go mod vendor
 ARG TARGETPLATFORM
 # gcc is only installed for libgcc
 # lld has issues building static binaries for ppc so prefer ld for it
@@ -62,7 +62,7 @@ RUN --mount=target=/root/.cache,type=cache <<EOT
   set -ex
   CGO_ENABLED=1 xx-go build -mod=vendor -ldflags '-extldflags -static' -tags 'apparmor seccomp netgo cgo static_build osusergo' -o /usr/bin/runc ./
   xx-verify --static /usr/bin/runc
-  if [ "$(xx-info os)" = "linux" ]; then /usr/bin/runc --version; fi
+  if [ "$(xx-info os)" = "linux" ] && ! xx-info is-cross; then /usr/bin/runc --version; fi
 EOT
 
 FROM gobuild-base AS buildkit-base
@@ -73,7 +73,7 @@ ENV GOFLAGS=-mod=vendor
 FROM buildkit-base AS buildkit-version
 # TODO: PKG should be inferred from go modules
 RUN --mount=target=. <<'EOT'
-  # if git is worktree (file starting with gitdir:) then skip verions check
+  # if git is worktree (file starting with gitdir:) then skip version check
   if [ -f .git ] && head -1 .git | grep -q "^gitdir:"; then
     echo >&2 "Skipping version check for worktree"
     # set dev stubs
@@ -104,7 +104,7 @@ RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   set -ex
   xx-go build ${GOBUILDFLAGS} -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildctl ./cmd/buildctl
   xx-verify --static /usr/bin/buildctl
-  if [ "$(xx-info os)" = "linux" ]; then /usr/bin/buildctl --version; fi
+  if [ "$(xx-info os)" = "linux" ] && ! xx-info is-cross; then /usr/bin/buildctl --version; fi
 EOT
 
 # buildkitd builds daemon binary
@@ -127,7 +127,7 @@ RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   # buildkitd --version can be flaky when running through emulation related to
   # https://github.com/moby/buildkit/pull/4491. Retry a few times as a workaround.
   set +ex
-  if [ "$(xx-info os)" = "linux" ]; then
+  if [ "$(xx-info os)" = "linux" ] && ! xx-info is-cross; then
     max_retries=5
     for attempt in $(seq "$max_retries"); do
       timeout 3 /usr/bin/buildkitd --version
@@ -159,16 +159,27 @@ RUN --mount=target=/root/.cache,type=cache \
     CGO_ENABLED=0 xx-go build -o /usr/bin/dnsname ./plugins/meta/dnsname && \
     xx-verify --static /usr/bin/dnsname
 
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS cni-plugins
-RUN apk add --no-cache curl
-COPY --from=xx / /
+FROM gobuild-base AS cni-plugins
+WORKDIR /go/src/github.com/containernetworking/plugins
 ARG CNI_VERSION
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETPLATFORM
+ADD --keep-git-dir=true "https://github.com/containernetworking/plugins.git#$CNI_VERSION" .
+RUN go get golang.org/x/net@v0.60.0 golang.org/x/sys@v0.48.0 \
+    github.com/buger/jsonparser@v1.1.2 \
+    github.com/insomniacslk/dhcp@v0.0.0-20260719225207-c76316d4aa82 \
+    google.golang.org/grpc@v1.84.0 \
+  && go mod tidy && go mod vendor
 WORKDIR /opt/cni/bin
-RUN curl -fsSL https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz | tar xzv
-RUN xx-verify --static bridge loopback host-local
+ARG TARGETPLATFORM
+RUN --mount=target=/root/.cache,type=cache <<EOT
+  set -ex
+  cd /go/src/github.com/containernetworking/plugins
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/bridge ./plugins/main/bridge
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/loopback ./plugins/main/loopback
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/host-local ./plugins/ipam/host-local
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/firewall ./plugins/meta/firewall
+  cd /opt/cni/bin
+  xx-verify --static bridge loopback host-local firewall
+EOT
 COPY --link --from=dnsname /usr/bin/dnsname /opt/cni/bin/
 
 FROM scratch AS cni-plugins-export
@@ -181,8 +192,8 @@ FROM scratch AS cni-plugins-export-squashed
 COPY --from=cni-plugins-export / /
 
 FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS binfmt-filter
-# built from https://github.com/tonistiigi/binfmt/releases/tag/buildkit%2Fv10.2.1-64
-COPY --link --from=tonistiigi/binfmt:buildkit-v10.2.1-64@sha256:4cf4c0ad4919b18996362536883de02420c1010654d3c2a2b63e9b72600fa3a9 / /out/
+# built from https://github.com/tonistiigi/binfmt/releases/tag/buildkit%2Fv10.2.3-66
+COPY --link --from=tonistiigi/binfmt:buildkit-v10.2.3-66@sha256:6014c1e52b8e51a67fbf76f691ffbe20ac0204c31c2f086df3e8ef3ce134b488 / /out/
 WORKDIR /out/
 RUN rm -f buildkit-qemu-loongarch64 buildkit-qemu-mips64 buildkit-qemu-mips64el
 
@@ -278,11 +289,11 @@ ARG CONTAINERD_VERSION
 ADD --keep-git-dir=true "https://github.com/containerd/containerd.git#$CONTAINERD_VERSION" .
 RUN /build.sh
 
-# containerd-alt-21 builds containerd v2.1 for integration tests
-FROM containerd-build AS containerd-alt-21
+# containerd-alt-23 builds containerd v2.3 for integration tests
+FROM containerd-build AS containerd-alt-23
 WORKDIR /go/src/github.com/containerd/containerd
-ARG CONTAINERD_ALT_VERSION_21
-ADD --keep-git-dir=true "https://github.com/containerd/containerd.git#$CONTAINERD_ALT_VERSION_21" .
+ARG CONTAINERD_ALT_VERSION_23
+ADD --keep-git-dir=true "https://github.com/containerd/containerd.git#$CONTAINERD_ALT_VERSION_23" .
 RUN /build.sh
 
 # containerd-alt-17 builds containerd v1.7 for integration tests
@@ -451,7 +462,7 @@ RUN curl -fsSL https://raw.githubusercontent.com/moby/moby/v25.0.1/hack/dind > /
   && chmod 0755 /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # musl is needed to directly use the registry binary that is built on alpine
-ENV BUILDKIT_INTEGRATION_CONTAINERD_EXTRA="containerd-2.1=/opt/containerd-alt-21/bin,containerd-1.7=/opt/containerd-alt-17/bin"
+ENV BUILDKIT_INTEGRATION_CONTAINERD_EXTRA="containerd-2.3=/opt/containerd-alt-23/bin,containerd-1.7=/opt/containerd-alt-17/bin"
 ENV BUILDKIT_INTEGRATION_SNAPSHOTTER=stargz
 ENV BUILDKIT_SETUP_CGROUPV2_ROOT=1
 ENV BUILDKIT_TEST_SIGN_FIXTURES=/tmp/buildkit_test_sign_fixtures
@@ -462,12 +473,12 @@ ENV GOTESTSUM_FORMAT=standard-verbose
 COPY --link --from=docker-engine / /usr/bin/
 RUN rm -f /usr/bin/vpnkit
 COPY --link --from=gotestsum /out /usr/bin/
-COPY --link --from=minio /usr/bin/minio /usr/bin/
-COPY --link --from=minio-mc /usr/bin/mc /usr/bin/
+COPY --link --from=silo /usr/bin/silo /usr/bin/
+COPY --link --from=silo /usr/bin/mcli /usr/bin/mc
 COPY --link --from=nydus /out/nydus-static/* /usr/bin/
 COPY --link --from=stargz-snapshotter /out/* /usr/bin/
 COPY --link --from=rootlesskit /rootlesskit /usr/bin/
-COPY --link --from=containerd-alt-21 /out/containerd* /opt/containerd-alt-21/bin/
+COPY --link --from=containerd-alt-23 /out/containerd* /opt/containerd-alt-23/bin/
 COPY --link --from=containerd-alt-17 /out/containerd* /opt/containerd-alt-17/bin/
 COPY --link --from=registry /out /usr/bin/
 COPY --link --from=runc /usr/bin/runc /usr/bin/

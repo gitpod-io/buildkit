@@ -10,7 +10,7 @@ FROM base AS doctoc
 
 # DOCTOC_VERSION is the version of doctoc to install
 # see https://github.com/thlorenz/doctoc/tags for available releases.
-ARG DOCTOC_VERSION=v2.3.0
+ARG DOCTOC_VERSION=v2.4.1
 RUN npm install -g doctoc@${DOCTOC_VERSION#v}
 RUN --mount=type=bind,source=README.md,target=README.md,rw <<EOT
   set -e

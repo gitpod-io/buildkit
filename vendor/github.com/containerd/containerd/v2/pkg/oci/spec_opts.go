@@ -24,11 +24,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +46,7 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/fsview"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -130,10 +134,8 @@ func setCapabilities(s *Spec) {
 // ensureAdditionalGids ensures that the primary GID is also included in the additional GID list.
 func ensureAdditionalGids(s *Spec) {
 	setProcess(s)
-	for _, f := range s.Process.User.AdditionalGids {
-		if f == s.Process.User.GID {
-			return
-		}
+	if slices.Contains(s.Process.User.AdditionalGids, s.Process.User.GID) {
+		return
 	}
 	s.Process.User.AdditionalGids = append([]uint32{s.Process.User.GID}, s.Process.User.AdditionalGids...)
 }
@@ -619,9 +621,7 @@ func WithUser(userstr string) SpecOpts {
 		// The `Username` field on the runtime spec is marked by Platform as only for Windows, and in this case it
 		// *is* being set on a Windows host at least, but will be used as a temporary holding spot until the guest
 		// can use the string to perform these same operations to grab the uid:gid inside.
-		//
-		// Mounts are not supported on Darwin, so using the same workaround.
-		if (s.Windows != nil && s.Linux != nil) || runtime.GOOS == "darwin" {
+		if s.Windows != nil && s.Linux != nil {
 			s.Process.User.Username = userstr
 			return nil
 		}
@@ -630,9 +630,15 @@ func WithUser(userstr string) SpecOpts {
 		switch len(parts) {
 		case 1:
 			v, err := strconv.Atoi(parts[0])
-			if err != nil || v < minUserID || v > maxUserID {
-				// if we cannot parse as an int32 then try to see if it is a username
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
+				}
+				// Non-numeric user value; treat it as a username.
 				return WithUsername(userstr)(ctx, client, c, s)
+			}
+			if v < minUserID || v > maxUserID {
+				return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
 			}
 			return WithUserID(uint32(v))(ctx, client, c, s)
 		case 2:
@@ -642,14 +648,24 @@ func WithUser(userstr string) SpecOpts {
 			)
 			var uid, gid uint32
 			v, err := strconv.Atoi(parts[0])
-			if err != nil || v < minUserID || v > maxUserID {
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
+				}
 				username = parts[0]
+			} else if v < minUserID || v > maxUserID {
+				return fmt.Errorf("invalid USER value %q: uid out of range", userstr)
 			} else {
 				uid = uint32(v)
 			}
 			v, err = strconv.Atoi(parts[1])
-			if err != nil || v < minGroupID || v > maxGroupID {
+			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("invalid USER value %q: gid out of range", userstr)
+				}
 				groupname = parts[1]
+			} else if v < minGroupID || v > maxGroupID {
+				return fmt.Errorf("invalid USER value %q: gid out of range", userstr)
 			} else {
 				gid = uint32(v)
 			}
@@ -724,6 +740,16 @@ func WithUIDGID(uid, gid uint32) SpecOpts {
 	}
 }
 
+// WithUmask sets the process user's umask in the OCI spec's Process.User.Umask
+func WithUmask(umask uint32) SpecOpts {
+	return func(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
+		setProcess(s)
+		u := umask
+		s.Process.User.Umask = &u
+		return nil
+	}
+}
+
 // WithUserID sets the correct UID and GID for the container based
 // on the image's /etc/passwd contents. If /etc/passwd does not exist,
 // or uid is not found in /etc/passwd, it sets the requested uid,
@@ -738,7 +764,7 @@ func WithUserID(uid uint32) SpecOpts {
 				return u.Uid == int(uid)
 			})
 			if err != nil {
-				if os.IsNotExist(err) || errors.Is(err, ErrNoUsersFound) {
+				if errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNoUsersFound) {
 					s.Process.User.UID, s.Process.User.GID = uid, 0
 					return nil
 				}
@@ -842,8 +868,8 @@ func WithUsername(username string) SpecOpts {
 // The passed in user can be either a uid or a username.
 func WithAdditionalGIDs(userstr string) SpecOpts {
 	return func(ctx context.Context, client Client, c *containers.Container, s *Spec) (err error) {
-		// For LCOW or on Darwin additional GID's not supported
-		if s.Windows != nil || runtime.GOOS == "darwin" {
+		// For LCOW additional GID's not supported
+		if s.Windows != nil {
 			return nil
 		}
 		setProcess(s)
@@ -857,7 +883,7 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 					return u.Uid == uid
 				})
 				if err != nil {
-					if os.IsNotExist(err) || errors.Is(err, ErrNoUsersFound) {
+					if errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrNoUsersFound) {
 						return nil
 					}
 					return err
@@ -871,15 +897,10 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 				if g.Name == username {
 					return false
 				}
-				for _, entry := range g.List {
-					if entry == username {
-						return true
-					}
-				}
-				return false
+				return slices.Contains(g.List, username)
 			})
 			if err != nil {
-				if os.IsNotExist(err) {
+				if errors.Is(err, fs.ErrNotExist) {
 					return nil
 				}
 				return err
@@ -919,6 +940,15 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 }
 
 func withReadonlyFS(ctx context.Context, client Client, mounts []mount.Mount, fn func(fs.FS) error) error {
+	// Try to avoid mount if possible by using fsview to directly open
+	// overlay/erofs/bind mounts without actually mounting them
+	if viewFS, err := fsview.FSMounts(mounts); err == nil && viewFS != nil {
+		defer viewFS.Close()
+		return fn(viewFS)
+	} else if !errors.Is(err, errdefs.ErrNotImplemented) || runtime.GOOS == "darwin" {
+		return err
+	}
+
 	var mm mount.Manager
 	if cwm, ok := client.(interface{ MountManager() mount.Manager }); ok {
 		mm = cwm.MountManager()
@@ -954,8 +984,8 @@ func withReadonlyFS(ctx context.Context, client Client, mounts []mount.Mount, fn
 // The passed in groups can be either a gid or a groupname.
 func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 	return func(ctx context.Context, client Client, c *containers.Container, s *Spec) (err error) {
-		// For LCOW or on Darwin additional GID's are not supported
-		if s.Windows != nil || runtime.GOOS == "darwin" {
+		// For LCOW additional GID's are not supported
+		if s.Windows != nil {
 			return nil
 		}
 		setProcess(s)
@@ -963,14 +993,14 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 			defer ensureAdditionalGids(s)
 
 			var ugroups []user.Group
-			f, groupErr := root.Open("etc/group")
+			f, groupErr := openUserFile(root, "etc/group")
 			if groupErr == nil {
 				defer f.Close()
 				ugroups, groupErr = user.ParseGroup(f)
 				if groupErr != nil {
 					return groupErr
 				}
-			} else if !os.IsNotExist(groupErr) {
+			} else if !errors.Is(groupErr, fs.ErrNotExist) {
 				return groupErr
 			}
 
@@ -1047,12 +1077,7 @@ func WithCapabilities(caps []string) SpecOpts {
 }
 
 func capsContain(caps []string, s string) bool {
-	for _, c := range caps {
-		if c == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(caps, s)
 }
 
 func removeCap(caps *[]string, s string) {
@@ -1142,7 +1167,7 @@ func UserFromPath(root string, filter func(user.User) bool) (user.User, error) {
 // UserFromFS inspects the user object using /etc/passwd in the specified fs.FS.
 // filter can be nil.
 func UserFromFS(root fs.FS, filter func(user.User) bool) (user.User, error) {
-	f, err := root.Open("etc/passwd")
+	f, err := openUserFile(root, "etc/passwd")
 	if err != nil {
 		return user.User{}, err
 	}
@@ -1174,7 +1199,7 @@ func GIDFromPath(root string, filter func(user.Group) bool) (gid uint32, err err
 // GIDFromFS inspects the GID using /etc/group in the specified fs.FS.
 // filter can be nil.
 func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error) {
-	f, err := root.Open("etc/group")
+	f, err := openUserFile(root, "etc/group")
 	if err != nil {
 		return 0, err
 	}
@@ -1191,7 +1216,7 @@ func GIDFromFS(root fs.FS, filter func(user.Group) bool) (gid uint32, err error)
 }
 
 func getSupplementalGroupsFromFS(root fs.FS, filter func(user.Group) bool) ([]uint32, error) {
-	f, err := root.Open("etc/group")
+	f, err := openUserFile(root, "etc/group")
 	if err != nil {
 		return []uint32{}, err
 	}
@@ -1459,9 +1484,7 @@ func WithAnnotations(annotations map[string]string) SpecOpts {
 		if s.Annotations == nil {
 			s.Annotations = make(map[string]string)
 		}
-		for k, v := range annotations {
-			s.Annotations[k] = v
-		}
+		maps.Copy(s.Annotations, annotations)
 		return nil
 	}
 }
@@ -1711,6 +1734,23 @@ func WithRdt(closID, l3CacheSchema, memBwSchema string) SpecOpts {
 	}
 }
 
+func WithRlimit(rlimit *specs.POSIXRlimit) SpecOpts {
+	return func(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
+		setProcess(s)
+		if s.Process.Rlimits == nil {
+			s.Process.Rlimits = make([]specs.POSIXRlimit, 0)
+		}
+		for i := range s.Process.Rlimits {
+			if s.Process.Rlimits[i].Type == rlimit.Type {
+				s.Process.Rlimits[i] = *rlimit
+				return nil
+			}
+		}
+		s.Process.Rlimits = append(s.Process.Rlimits, *rlimit)
+		return nil
+	}
+}
+
 // WithWindowsCPUCount sets the `Windows.Resources.CPU.Count` section to the
 // `count` specified. It is a no-op for non-Windows specs.
 func WithWindowsCPUCount(count uint64) SpecOpts {
@@ -1788,4 +1828,79 @@ func WithWindowsNetworkNamespace(ns string) SpecOpts {
 		s.Windows.Network.NetworkNamespace = ns
 		return nil
 	}
+}
+
+// openUserFile attempts to open a file within the root fs.
+// It handles cases where the path contains symlinks (e.g., NixOS
+// /etc/passwd -> /nix/store/...). os.Root-backed filesystems reject
+// absolute symlinks, so when the direct open fails the path is resolved
+// within the root via resolveInRootFS and the open is retried.
+//
+// The returned file rejects non-regular sources and returns an error if more
+// than maxUserFileBytes are read from it.
+func openUserFile(root fs.FS, name string) (fs.File, error) {
+	f, err := root.Open(name)
+	if err == nil {
+		return wrapUserFile(f, name)
+	}
+
+	lfs, ok := root.(fs.ReadLinkFS)
+	if !ok {
+		return nil, err
+	}
+
+	resolvedName, err := resolveInRootFS(lfs, name)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err = root.Open(resolvedName)
+	if err != nil {
+		return nil, err
+	}
+	return wrapUserFile(f, name)
+}
+
+// maxUserFileBytes caps how much data is read from any user-database file
+// opened via openUserFile. Real systems keep these files well under 1 MiB;
+// 10 MiB is generous headroom while keeping peak memory during
+// user.ParsePasswd/ParseGroup bounded to single-digit MiB.
+const maxUserFileBytes = 10 << 20
+
+// wrapUserFile rejects non-regular sources and returns an fs.File that
+// errors out if more than maxUserFileBytes are read from it.
+func wrapUserFile(f fs.File, name string) (fs.File, error) {
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat %s: %w", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	return &limitedFile{
+		File: f,
+		// Allow one byte past the cap so an overflow surfaces as an
+		// error rather than a silent EOF that the parser would treat as
+		// a clean end-of-file (and miss any entries past the cap).
+		r:    &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
+		name: name,
+	}, nil
+}
+
+// limitedFile is an fs.File whose Read returns an error once more than
+// maxUserFileBytes have been read.
+type limitedFile struct {
+	fs.File
+	r    *io.LimitedReader
+	name string
+}
+
+func (l *limitedFile) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.r.N == 0 {
+		return n, fmt.Errorf("%q exceeds %d bytes", l.name, maxUserFileBytes)
+	}
+	return n, err
 }

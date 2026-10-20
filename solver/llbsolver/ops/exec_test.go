@@ -1,15 +1,22 @@
 package ops
 
 import (
+	"bytes"
 	"context"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/network"
+	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func TestDedupePaths(t *testing.T) {
@@ -33,6 +40,29 @@ func TestDedupePaths(t *testing.T) {
 
 	res = dedupePaths([]string{"/", "/foo"})
 	require.Equal(t, []string{"/"}, res)
+}
+
+func TestLogProxyRequests(t *testing.T) {
+	var buf bytes.Buffer
+	logProxyRequests(&buf, []network.ProxyRequest{
+		{Method: "GET", URL: "https://example.com/file", StatusCode: http.StatusOK},
+		{Method: "POST", URL: "https://xxxxx:xxxxx@example.com/token", StatusCode: http.StatusCreated},
+		{Method: "GET", URL: "https://example.com/unknown-status"},
+	})
+
+	require.Equal(t, strings.Join([]string{
+		"proxy network requests:",
+		"- GET https://example.com/file -> 200",
+		"- POST https://xxxxx:xxxxx@example.com/token -> 201",
+		"- GET https://example.com/unknown-status",
+		"",
+	}, "\n"), buf.String())
+}
+
+func TestLogProxyRequestsEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	logProxyRequests(&buf, nil)
+	require.Empty(t, buf.String())
 }
 
 func TestExecOpCacheMap(t *testing.T) {
@@ -107,7 +137,7 @@ func TestExecOpCacheMap(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -127,6 +157,34 @@ func TestExecOpCacheMap(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecOpCacheMapRejectsOnDemandCDIWithoutInputs(t *testing.T) {
+	const kind = "buildkit.test/on-demand-device"
+	cdidevices.Register(kind, cacheMapCDISetup{})
+	cache, err := cdi.NewCache(cdi.WithSpecDirs(t.TempDir()))
+	require.NoError(t, err)
+
+	op := newExecOp()
+	op.op.CdiDevices = []*pb.CDIDevice{{Name: kind}}
+	op.w = &cacheMapCDIWorker{cdi: cdidevices.NewManager(cache, nil)}
+
+	_, _, err = op.CacheMap(t.Context(), testJobContext(t), 0)
+	require.EqualError(t, err, `cannot set up CDI device "buildkit.test/on-demand-device" without an input`)
+}
+
+type cacheMapCDISetup struct{}
+
+func (cacheMapCDISetup) Validate() error           { return nil }
+func (cacheMapCDISetup) Run(context.Context) error { return nil }
+
+type cacheMapCDIWorker struct {
+	worker.Worker
+	cdi *cdidevices.Manager
+}
+
+func (w *cacheMapCDIWorker) CDIManager() *cdidevices.Manager {
+	return w.cdi
 }
 
 func TestExecOpContentCache(t *testing.T) {
@@ -191,7 +249,7 @@ func TestExecOpContentCache(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -310,4 +368,8 @@ func (j *jobCtx) Cleanup(f func() error) error {
 
 func (j *jobCtx) ResolverCache() solver.ResolverCache {
 	return nil
+}
+
+func (j *jobCtx) CompatibilityVersion() (int, error) {
+	return 0, nil
 }

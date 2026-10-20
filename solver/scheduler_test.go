@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1108,6 +1109,130 @@ func TestSlowCache(t *testing.T) {
 	j1 = nil
 }
 
+func TestSlowCacheErrorResultReleasedWithJob(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	l := NewSolver(SolverOpt{
+		ResolveOpFunc: testOpResolver,
+	})
+	defer l.Close()
+
+	j, err := l.NewJob("j0")
+	require.NoError(t, err)
+	defer func() {
+		if j != nil {
+			require.NoError(t, j.Discard())
+		}
+	}()
+
+	var releaseCount atomic.Int64
+
+	inputRes := &countedResult{
+		id:           identity.NewID(),
+		value:        "input",
+		releaseCount: &releaseCount,
+	}
+
+	g := Edge{
+		Vertex: vtx(vtxOpt{
+			name:         "v0",
+			cacheKeySeed: "seed0",
+			value:        "result0",
+			inputs: []Edge{
+				{Vertex: vtx(vtxOpt{
+					name:         "v1",
+					cacheKeySeed: "seed1",
+					result:       inputRes,
+				})},
+			},
+			slowCacheCompute: map[int]ResultBasedCacheFunc{
+				0: func(context.Context, Result, session.Group) (digest.Digest, error) {
+					return "", errors.New("slow cache error")
+				},
+			},
+		}),
+	}
+
+	_, err = j.Build(ctx, g)
+	require.Error(t, err)
+
+	var sce *SlowCacheError
+	require.ErrorAs(t, err, &sce)
+	require.NotNil(t, sce.Result)
+
+	require.Never(t, func() bool {
+		return releaseCount.Load() != 0
+	}, 100*time.Millisecond, 10*time.Millisecond)
+
+	require.NoError(t, j.Discard())
+	j = nil
+
+	require.Eventually(t, func() bool {
+		return releaseCount.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestExecErrorRefsReleasedAfterJobDiscard(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeoutCause(t.Context(), 5*time.Second, errors.New("exec error ref test timed out"))
+	defer cancel()
+
+	started := make(chan struct{})
+	resume := make(chan struct{})
+	resumeExec := sync.OnceFunc(func() { close(resume) })
+
+	var cloneCount, releaseCount atomic.Int64
+	failedRef := &countedResult{
+		id:           identity.NewID(),
+		cloneCount:   &cloneCount,
+		releaseCount: &releaseCount,
+	}
+	g := Edge{Vertex: vtx(vtxOpt{
+		name: "failed-exec",
+		execPreFunc: func(context.Context) error {
+			close(started)
+			<-resume
+			return &execRefError{error: errors.New("exec failed"), ref: failedRef}
+		},
+	})}
+
+	l := NewSolver(SolverOpt{ResolveOpFunc: testOpResolver})
+	defer l.Close()
+	j, err := l.NewJob("j0")
+	require.NoError(t, err)
+	defer j.Discard()
+	defer resumeExec()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := j.Build(ctx, g)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("exec did not start")
+	}
+
+	// A failed exec can finish after its job has released the vertex.
+	require.NoError(t, j.Discard())
+	resumeExec()
+	select {
+	case err := <-done:
+		require.ErrorContains(t, err, "exec failed")
+	case <-ctx.Done():
+		t.Fatal("build did not finish")
+	}
+
+	// Retaining no clones is also valid once the vertex has been released.
+	require.Eventually(t, func() bool {
+		return releaseCount.Load() == cloneCount.Load()
+	}, time.Second, 10*time.Millisecond,
+		"failed exec error refs must not outlive the job (clones=%d, releases=%d)",
+		cloneCount.Load(), releaseCount.Load())
+}
+
 // TestParallelInputs validates that inputs are processed in parallel
 func TestParallelInputs(t *testing.T) {
 	t.Parallel()
@@ -1194,7 +1319,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed1",
 					value:        "result1",
 					cachePreFunc: func(ctx context.Context) error {
-						return errors.Errorf("error-from-test")
+						return errors.New("error-from-test")
 					},
 				})},
 				{Vertex: vtx(vtxOpt{
@@ -1281,7 +1406,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed3",
 					value:        "result2",
 					execPreFunc: func(ctx context.Context) error {
-						return errors.Errorf("exec-error-from-test")
+						return errors.New("exec-error-from-test")
 					},
 				})},
 			},
@@ -3471,6 +3596,35 @@ func TestInputRequestDeadlock(t *testing.T) {
 	j2 = nil
 }
 
+func TestCacheMapDependencyCount(t *testing.T) {
+	t.Parallel()
+
+	for _, depCount := range []int{0, 2} {
+		t.Run(fmt.Sprintf("deps=%d", depCount), func(t *testing.T) {
+			s := NewSolver(SolverOpt{
+				ResolveOpFunc: testOpResolver,
+			})
+			defer s.Close()
+
+			job, err := s.NewJob(fmt.Sprintf("invalid-cache-map-%d", depCount))
+			require.NoError(t, err)
+			defer job.Discard()
+
+			v := &invalidCacheMapVertex{
+				vertex: vtx(vtxOpt{
+					name: fmt.Sprintf("invalid-cache-map-%d", depCount),
+					inputs: []Edge{{
+						Vertex: vtx(vtxOpt{name: "input"}),
+					}},
+				}),
+				depCount: depCount,
+			}
+			_, err = job.Build(t.Context(), Edge{Vertex: v})
+			require.ErrorContains(t, err, fmt.Sprintf("invalid cache map: expected dependency count 1, got %d", depCount))
+		})
+	}
+}
+
 func TestUnknownBuildID(t *testing.T) {
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -3655,6 +3809,7 @@ type vtxOpt struct {
 	execPreFunc      func(context.Context) error
 	inputs           []Edge
 	value            string
+	result           Result
 	slowCacheCompute map[int]ResultBasedCacheFunc
 	selectors        map[int]digest.Digest
 	cacheSource      CacheManager
@@ -3676,6 +3831,26 @@ type vertex struct {
 
 	cacheCallCount *int64
 	execCallCount  *int64
+}
+
+type invalidCacheMapVertex struct {
+	*vertex
+	depCount int
+}
+
+func (v *invalidCacheMapVertex) Sys() any {
+	return v
+}
+
+func (v *invalidCacheMapVertex) CacheMap(context.Context, JobContext, int) (*CacheMap, bool, error) {
+	return &CacheMap{
+		Digest: digest.FromBytes([]byte(v.Name())),
+		Deps: make([]struct {
+			Selector          digest.Digest
+			ComputeDigestFunc ResultBasedCacheFunc
+			PreprocessFunc    PreprocessFunc
+		}, v.depCount),
+	}, true, nil
 }
 
 var _ Op = &vertex{}
@@ -3768,7 +3943,7 @@ func (v *vertex) CacheMap(ctx context.Context, jobCtx JobContext, index int) (*C
 
 func (v *vertex) exec(ctx context.Context, inputs []Result) error {
 	if len(inputs) != len(v.Inputs()) {
-		return errors.Errorf("invalid number of inputs")
+		return errors.New("invalid number of inputs")
 	}
 	if f := v.opt.execPreFunc; f != nil {
 		if err := f(ctx); err != nil {
@@ -3794,6 +3969,9 @@ func (v *vertex) exec(ctx context.Context, inputs []Result) error {
 func (v *vertex) Exec(ctx context.Context, job JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
+	}
+	if v.opt.result != nil {
+		return []Result{v.opt.result}, nil
 	}
 	return []Result{&dummyResult{id: identity.NewID(), value: v.opt.value}}, nil
 }
@@ -3990,6 +4168,44 @@ func (r *dummyResult) Release(context.Context) error { return nil }
 func (r *dummyResult) Sys() any                      { return r }
 func (r *dummyResult) Clone() Result                 { return r }
 
+type countedResult struct {
+	id           string
+	value        string
+	cloneCount   *atomic.Int64
+	releaseCount *atomic.Int64
+}
+
+func (r *countedResult) ID() string { return r.id }
+func (r *countedResult) Release(context.Context) error {
+	if r.releaseCount != nil {
+		r.releaseCount.Add(1)
+	}
+	return nil
+}
+func (r *countedResult) Sys() any { return &dummyResult{id: r.id, value: r.value} }
+func (r *countedResult) Clone() Result {
+	if r.cloneCount != nil {
+		r.cloneCount.Add(1)
+	}
+	return &countedResult{
+		id:           r.id,
+		value:        r.value,
+		cloneCount:   r.cloneCount,
+		releaseCount: r.releaseCount,
+	}
+}
+
+// execRefError models an exec error owning a failed snapshot without
+// importing llbsolver/errdefs, which depends on this package.
+type execRefError struct {
+	error
+	ref Result
+}
+
+func (e *execRefError) EachRef(fn func(Result) error) error {
+	return fn(e.ref)
+}
+
 func testOpResolver(v Vertex, b Builder) (Op, error) {
 	if op, ok := v.Sys().(Op); ok {
 		if vtx, ok := op.(*vertexSubBuild); ok {
@@ -3998,7 +4214,7 @@ func testOpResolver(v Vertex, b Builder) (Op, error) {
 		return op, nil
 	}
 
-	return nil, errors.Errorf("invalid vertex")
+	return nil, errors.New("invalid vertex")
 }
 
 func unwrap(res Result) string {
@@ -4042,7 +4258,7 @@ type trackingCacheManager struct {
 func (cm *trackingCacheManager) Load(ctx context.Context, rec *CacheRecord) (Result, error) {
 	atomic.AddInt64(&cm.loadCounter, 1)
 	if cm.forceFail {
-		return nil, errors.Errorf("force fail")
+		return nil, errors.New("force fail")
 	}
 	return cm.CacheManager.Load(ctx, rec)
 }

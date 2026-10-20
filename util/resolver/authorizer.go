@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"maps"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/remotes/docker"
@@ -20,6 +23,7 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/errutil"
 	"github.com/moby/buildkit/util/flightcontrol"
+	"github.com/moby/buildkit/util/resolver/retryhandler"
 	"github.com/moby/buildkit/version"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -28,7 +32,7 @@ import (
 const defaultExpiration = 60
 
 type authHandlerNS struct {
-	counter int64 // needs to be 64bit aligned for 32bit systems
+	counter atomic.Int64
 
 	fetchers   map[string]*authFetcher
 	muHandlers sync.Mutex
@@ -47,6 +51,7 @@ func newAuthHandlerNS(sm *session.Manager) *authHandlerNS {
 }
 
 func (a *authHandlerNS) get(ctx context.Context, host string, sm *session.Manager, g session.Group) *authFetcher {
+	hasSession := false
 	if g != nil {
 		if iter := g.SessionIterator(); iter != nil {
 			for {
@@ -54,12 +59,21 @@ func (a *authHandlerNS) get(ctx context.Context, host string, sm *session.Manage
 				if id == "" {
 					break
 				}
+				hasSession = true
 				h, ok := a.fetchers[host+"/"+id]
 				if ok {
 					h.lastUsed = time.Now()
 					return h
 				}
 			}
+		}
+	}
+
+	if !hasSession {
+		h, ok := a.fetchers[host+"/"]
+		if ok {
+			h.lastUsed = time.Now()
+			return h
 		}
 	}
 
@@ -185,12 +199,12 @@ func (a *dockerAuthorizer) AddResponses(ctx context.Context, responses []*http.R
 
 			var username, secret string
 			sessionID, pubKey, err := sessionauth.GetTokenAuthority(ctx, host, a.sm, a.session)
-			if err != nil {
+			if err != nil && !errors.Is(err, session.ErrNoActiveSessions) {
 				return err
 			}
 			if pubKey == nil {
 				sessionID, username, secret, err = a.getCredentials(ctx, host)
-				if err != nil {
+				if err != nil && !errors.Is(err, session.ErrNoActiveSessions) {
 					return err
 				}
 			}
@@ -374,7 +388,9 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 		}()
 		// try GET first because Docker Hub does not support POST
 		// switch once support has landed
-		resp, err := auth.FetchToken(ctx, ah.client, nil, to)
+		resp, err := retryTokenRequest(ctx, func(ctx context.Context) (*auth.FetchTokenResponse, error) {
+			return auth.FetchToken(ctx, ah.client, nil, to)
+		})
 		if err != nil {
 			var errStatus remoteserrors.ErrUnexpectedStatus
 			if errors.As(err, &errStatus) {
@@ -382,7 +398,9 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 				// As of September 2017, GCR is known to return 404.
 				// As of February 2018, JFrog Artifactory is known to return 401.
 				if (errStatus.StatusCode == http.StatusMethodNotAllowed && to.Username != "") || errStatus.StatusCode == http.StatusNotFound || errStatus.StatusCode == http.StatusUnauthorized {
-					resp, err := auth.FetchTokenWithOAuth(ctx, ah.client, hdr, "buildkit-client", to)
+					resp, err := retryTokenRequest(ctx, func(ctx context.Context) (*auth.OAuthTokenResponse, error) {
+						return auth.FetchTokenWithOAuth(ctx, ah.client, hdr, "buildkit-client", to)
+					})
 					if err != nil {
 						return nil, err
 					}
@@ -408,7 +426,9 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 		return nil, nil
 	}
 	// do request anonymously
-	resp, err := auth.FetchToken(ctx, ah.client, hdr, to)
+	resp, err := retryTokenRequest(ctx, func(ctx context.Context) (*auth.FetchTokenResponse, error) {
+		return auth.FetchToken(ctx, ah.client, hdr, to)
+	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch anonymous token")
 	}
@@ -419,6 +439,20 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 
 	token = resp.Token
 	return nil, nil
+}
+
+// The containerd resolver retries EOF and timeout errors returned by Authorize
+// on the final registry host. Earlier hosts fall through to the next host.
+// Retrying those errors here would multiply the final host's attempts and
+// backoff. Connection resets and token 5xx responses still need a retry here.
+func retryTokenRequest[T any](ctx context.Context, f func(context.Context) (T, error)) (T, error) {
+	return retryhandler.WithRetryIf(ctx, nil, f, func(err error) bool {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false
+		}
+		var netErr net.Error
+		return !errors.As(err, &netErr) || !netErr.Timeout()
+	})
 }
 
 func invalidAuthorization(c auth.Challenge, responses []*http.Response) error {

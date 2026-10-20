@@ -51,6 +51,7 @@ import (
 	"github.com/moby/buildkit/util/overlay"
 	"github.com/moby/buildkit/util/winlayers"
 	digest "github.com/opencontainers/go-digest"
+	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
@@ -68,12 +69,41 @@ type cmOut struct {
 	manager Manager
 	lm      leases.Manager
 	cs      content.Store
+	// testSnapshotter bypasses the namespaced wrapper and must only be used by
+	// tests that need to simulate out-of-band snapshotter changes.
+	testSnapshotter snapshots.Snapshotter
+}
+
+type prepareLabelSnapshotter struct {
+	snapshots.Snapshotter
+
+	mu          sync.Mutex
+	snapshotRef string
+}
+
+func (s *prepareLabelSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	info := snapshots.Info{}
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.Lock()
+	s.snapshotRef = info.Labels["containerd.io/snapshot.ref"]
+	s.mu.Unlock()
+	return s.Snapshotter.Prepare(ctx, key, parent, opts...)
+}
+
+func (s *prepareLabelSnapshotter) getSnapshotRef() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotRef
 }
 
 func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, cleanup func(), err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
-		return nil, nil, errors.Errorf("namespace required for test")
+		return nil, nil, errors.New("namespace required for test")
 	}
 
 	if opt.snapshotterName == "" {
@@ -126,7 +156,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		opt.snapshotterName: opt.snapshotter,
 	})
-	if err := mdb.Init(context.TODO()); err != nil {
+	if err := mdb.Init(t.Context()); err != nil {
 		return nil, nil, err
 	}
 
@@ -144,8 +174,9 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 		return md.Close()
 	})
 
+	metadataSnapshotter := mdb.Snapshotter(opt.snapshotterName)
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, metadataSnapshotter), nil),
 		MetadataStore:  md,
 		ContentStore:   store,
 		LeaseManager:   lm,
@@ -163,22 +194,24 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 	})
 
 	return &cmOut{
-		manager: cm,
-		lm:      lm,
-		cs:      store,
+		manager:         cm,
+		lm:              lm,
+		cs:              store,
+		testSnapshotter: metadataSnapshotter,
 	}, cleanup, nil
 }
 
 func TestSharableMountPoolCleanup(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
 	// Emulate the situation where the pool dir is dirty
 	mountPoolDir := filepath.Join(tmpdir, "cachemounts")
 	require.NoError(t, os.MkdirAll(mountPoolDir, 0700))
-	_, err := os.MkdirTemp(mountPoolDir, "buildkit")
+	// not using t.TempDir() here because the dir must be created inside mountPoolDir
+	_, err := os.MkdirTemp(mountPoolDir, "buildkit") //nolint:usetesting
 	require.NoError(t, err)
 
 	// Initialize cache manager and check if pool is cleaned up
@@ -196,7 +229,7 @@ func TestSharableMountPoolCleanup(t *testing.T) {
 func TestManager(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -329,7 +362,7 @@ func TestManager(t *testing.T) {
 
 func TestLazyGetByBlob(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -348,16 +381,20 @@ func TestLazyGetByBlob(t *testing.T) {
 	// different digests (due to different compression) and make sure GetByBlob still works
 	_, desc, err := mapToBlob(map[string]string{"foo": "bar"}, true)
 	require.NoError(t, err)
+	tocDigest := digest.FromBytes([]byte("toc"))
+	desc.Annotations[estargz.TOCJSONDigestAnnotation] = tocDigest.String()
 	descHandlers := DescHandlers(make(map[digest.Digest]*DescHandler))
 	descHandlers[desc.Digest] = &DescHandler{}
 	diffID, err := diffIDFromDescriptor(desc)
 	require.NoError(t, err)
 
-	_, err = cm.GetByBlob(ctx, desc, nil, descHandlers)
+	ref, err := cm.GetByBlob(ctx, desc, nil, descHandlers)
 	require.NoError(t, err)
 
 	_, desc2, err := mapToBlob(map[string]string{"foo": "bar"}, false)
 	require.NoError(t, err)
+	tocDigest2 := digest.FromBytes([]byte("toc2"))
+	desc2.Annotations[estargz.TOCJSONDigestAnnotation] = tocDigest2.String()
 	descHandlers2 := DescHandlers(make(map[digest.Digest]*DescHandler))
 	descHandlers2[desc2.Digest] = &DescHandler{}
 	diffID2, err := diffIDFromDescriptor(desc2)
@@ -366,13 +403,334 @@ func TestLazyGetByBlob(t *testing.T) {
 	require.NotEqual(t, desc.Digest, desc2.Digest)
 	require.Equal(t, diffID, diffID2)
 
-	_, err = cm.GetByBlob(ctx, desc2, nil, descHandlers2)
+	ref2, err := cm.GetByBlob(ctx, desc2, nil, descHandlers2)
 	require.NoError(t, err)
+
+	nativeRef := ref.(*immutableRef)
+	nativeRef2 := ref2.(*immutableRef)
+	require.Equal(t, nativeRef.getChainID(), nativeRef2.getChainID())
+	require.Equal(t, nativeRef.getSnapshotID(), nativeRef2.getSnapshotID())
+	require.Equal(t, snapshot.LayerSnapshotID(diffID), nativeRef.getSnapshotID())
+
+	stargzCO, stargzCleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotterName: "stargz",
+	})
+	require.NoError(t, err)
+	t.Cleanup(stargzCleanup)
+	stargzCM := stargzCO.manager
+
+	ref, err = stargzCM.GetByBlob(ctx, desc, nil, descHandlers)
+	require.NoError(t, err)
+	ref2, err = stargzCM.GetByBlob(ctx, desc2, nil, descHandlers2)
+	require.NoError(t, err)
+
+	stargzRef := ref.(*immutableRef)
+	stargzRef2 := ref2.(*immutableRef)
+	require.Equal(t, diffID, stargzRef.getDiffID())
+	require.Equal(t, diffID2, stargzRef2.getDiffID())
+	require.Equal(t, imagespecidentity.ChainID([]digest.Digest{diffID, tocDigest}), stargzRef.getChainID())
+	require.Equal(t, imagespecidentity.ChainID([]digest.Digest{diffID2, tocDigest2}), stargzRef2.getChainID())
+	require.NotEqual(t, stargzRef.getChainID(), stargzRef2.getChainID())
+	require.Equal(t, snapshot.LayerSnapshotID(stargzRef.getChainID()), stargzRef.getSnapshotID())
+	require.Equal(t, snapshot.LayerSnapshotID(stargzRef2.getChainID()), stargzRef2.getSnapshotID())
+	require.NotEqual(t, stargzRef.getSnapshotID(), stargzRef2.getSnapshotID())
+}
+
+func TestGetByBlobRejectsBlobChainWithDifferentTOC(t *testing.T) {
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotterName: "stargz",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	blobDigest := digest.FromBytes([]byte("advertised blob"))
+	diffID := digest.FromBytes([]byte("advertised diffID"))
+	tocDigest := digest.FromBytes([]byte("toc"))
+	tocDigest2 := digest.FromBytes([]byte("toc2"))
+	desc := ocispecs.Descriptor{
+		Digest: blobDigest,
+		Annotations: map[string]string{
+			labels.LabelUncompressed:        diffID.String(),
+			estargz.TOCJSONDigestAnnotation: tocDigest.String(),
+		},
+	}
+	desc2 := ocispecs.Descriptor{
+		Digest: blobDigest,
+		Annotations: map[string]string{
+			labels.LabelUncompressed:        diffID.String(),
+			estargz.TOCJSONDigestAnnotation: tocDigest2.String(),
+		},
+	}
+	descHandlers := DescHandlers{
+		blobDigest: &DescHandler{},
+	}
+
+	ref, err := co.manager.GetByBlob(ctx, desc, nil, descHandlers)
+	require.NoError(t, err)
+	ref2, err := co.manager.GetByBlob(ctx, desc2, nil, descHandlers)
+	require.NoError(t, err)
+
+	stargzRef := ref.(*immutableRef)
+	stargzRef2 := ref2.(*immutableRef)
+	require.Equal(t, stargzRef.getBlobChainID(), stargzRef2.getBlobChainID())
+	require.NotEqual(t, stargzRef.ID(), stargzRef2.ID())
+	require.NotEqual(t, stargzRef.getChainID(), stargzRef2.getChainID())
+	require.NotEqual(t, stargzRef.getSnapshotID(), stargzRef2.getSnapshotID())
+}
+
+func TestGetByBlobIgnoresLegacyChainIDSnapshot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+	cmm := co.manager.(*cacheManager)
+
+	attackerBlob, attackerDesc, err := mapToBlobWithFileMode(map[string]string{"proof": "ATTACKER"}, true, 0600)
+	require.NoError(t, err)
+	victimBlob, victimDesc, err := mapToBlobWithFileMode(map[string]string{"proof": "VICTIM"}, true, 0600)
+	require.NoError(t, err)
+	victimDiffID := digest.Digest(victimDesc.Annotations[labels.LabelUncompressed])
+	attackerDesc.Annotations[labels.LabelUncompressed] = victimDiffID.String()
+
+	err = content.WriteBlob(ctx, co.cs, "attacker", bytes.NewBuffer(attackerBlob), attackerDesc)
+	require.NoError(t, err)
+	err = content.WriteBlob(ctx, co.cs, "victim", bytes.NewBuffer(victimBlob), victimDesc)
+	require.NoError(t, err)
+
+	legacyRef, err := cm.GetByBlob(ctx, attackerDesc, nil)
+	require.NoError(t, err)
+	legacySnapshotID := victimDiffID.String()
+	key := "legacy-poisoned"
+	err = cmm.Snapshotter.Prepare(ctx, key, "")
+	require.NoError(t, err)
+	mountable, err := cmm.Snapshotter.Mounts(ctx, key)
+	require.NoError(t, err)
+	mounts, unmount, err := mountable.Mount()
+	require.NoError(t, err)
+	_, err = cmm.Applier.Apply(ctx, attackerDesc, mounts)
+	require.NoError(t, err)
+	require.NoError(t, unmount())
+	err = cmm.Snapshotter.Commit(ctx, legacySnapshotID, key)
+	require.NoError(t, err)
+
+	legacy := legacyRef.(*immutableRef)
+	legacy.queueSnapshotID(legacySnapshotID)
+	legacy.queueBlobOnly(false)
+	require.NoError(t, legacy.commitMetadata())
+	require.NoError(t, legacyRef.Release(ctx))
+
+	trustedRef, err := cm.GetByBlob(ctx, victimDesc, nil)
+	require.NoError(t, err)
+	require.Equal(t, snapshot.LayerSnapshotID(victimDiffID), trustedRef.(*immutableRef).getSnapshotID())
+
+	mnt, err := trustedRef.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	lm := snapshot.LocalMounter(mnt)
+	target, err := lm.Mount()
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, lm.Unmount())
+	}()
+
+	dt, err := os.ReadFile(filepath.Join(target, "proof"))
+	require.NoError(t, err)
+	require.Equal(t, "VICTIM", string(dt))
+}
+
+func TestGetByBlobQuarantinesLegacyLayerAncestry(t *testing.T) {
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	baseBlob, baseDesc, err := mapToBlob(map[string]string{"base": "base"}, true)
+	require.NoError(t, err)
+	attackerBlob, attackerDesc, err := mapToBlob(map[string]string{"proof": "attacker"}, true)
+	require.NoError(t, err)
+	victimBlob, victimDesc, err := mapToBlob(map[string]string{"proof": "victim"}, true)
+	require.NoError(t, err)
+	victimDiffID := digest.Digest(victimDesc.Annotations[labels.LabelUncompressed])
+	attackerDesc.Annotations[labels.LabelUncompressed] = victimDiffID.String()
+
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "base", bytes.NewReader(baseBlob), baseDesc))
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "attacker", bytes.NewReader(attackerBlob), attackerDesc))
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "victim", bytes.NewReader(victimBlob), victimDesc))
+
+	base, err := cm.GetByBlob(ctx, baseDesc, nil)
+	require.NoError(t, err)
+	legacy, err := cm.GetByBlob(ctx, attackerDesc, base)
+	require.NoError(t, err)
+	upper, err := cm.GetByBlob(ctx, victimDesc, legacy)
+	require.NoError(t, err)
+	legacyRef := legacy.(*immutableRef)
+	legacyRef.queueSnapshotID(legacyRef.getChainID().String())
+	legacyRef.queueBlobOnly(false)
+	require.NoError(t, legacyRef.commitMetadata())
+	require.True(t, isLegacyLayerSnapshotID(legacyRef))
+	require.True(t, hasLegacyLayerSnapshotID(legacyRef))
+
+	hiddenDiff, err := cm.Diff(ctx, legacy, upper, nil)
+	require.NoError(t, err)
+	_, err = hiddenDiff.GetRemotes(ctx, true, config.RefConfig{Compression: compression.New(compression.Default)}, false, nil)
+	require.NoError(t, err)
+	hiddenDiffRef := hiddenDiff.(*immutableRef)
+	require.Empty(t, hiddenDiffRef.getChainID())
+	require.Empty(t, hiddenDiffRef.getBlobChainID())
+	require.True(t, hasLegacyLayerSnapshotID(hiddenDiffRef))
+	hiddenMerge, err := cm.Merge(ctx, []ImmutableRef{base, hiddenDiff}, nil)
+	require.NoError(t, err)
+	_, err = hiddenMerge.GetRemotes(ctx, true, config.RefConfig{Compression: compression.New(compression.Default)}, false, nil)
+	require.NoError(t, err)
+	hiddenMergeRef := hiddenMerge.(*immutableRef)
+	require.Empty(t, hiddenMergeRef.getChainID())
+	require.Empty(t, hiddenMergeRef.getBlobChainID())
+	require.True(t, hasLegacyLayerSnapshotID(hiddenMergeRef))
+
+	_, err = cm.GetByBlob(ctx, victimDesc, legacy)
+	require.ErrorContains(t, err, "non-addressable parent")
+
+	diff, err := cm.Diff(ctx, base, legacy, nil)
+	require.NoError(t, err)
+	_, err = diff.GetRemotes(ctx, true, config.RefConfig{Compression: compression.New(compression.Default)}, false, nil)
+	require.NoError(t, err)
+	diffRef := diff.(*immutableRef)
+	require.Empty(t, diffRef.getChainID())
+	require.Empty(t, diffRef.getBlobChainID())
+	require.True(t, hasLegacyLayerSnapshotID(diffRef))
+
+	merged, err := cm.Merge(ctx, []ImmutableRef{base, diff}, nil)
+	require.NoError(t, err)
+	_, err = merged.GetRemotes(ctx, true, config.RefConfig{Compression: compression.New(compression.Default)}, false, nil)
+	require.NoError(t, err)
+	mergedRef := merged.(*immutableRef)
+	require.Empty(t, mergedRef.getChainID())
+	require.Empty(t, mergedRef.getBlobChainID())
+	require.True(t, hasLegacyLayerSnapshotID(mergedRef))
+
+	// Emulate a Merge indexed by an older daemon before ancestry quarantine.
+	expectedChainID := imagespecidentity.ChainID([]digest.Digest{base.(*immutableRef).getChainID(), victimDiffID})
+	blobID := imagespecidentity.ChainID([]digest.Digest{attackerDesc.Digest, victimDiffID})
+	expectedBlobChainID := imagespecidentity.ChainID([]digest.Digest{base.(*immutableRef).getBlobChainID(), blobID})
+	mergedRef.queueChainID(expectedChainID)
+	mergedRef.queueBlobChainID(expectedBlobChainID)
+	require.NoError(t, mergedRef.commitMetadata())
+
+	victim, err := cm.GetByBlob(ctx, victimDesc, base)
+	require.NoError(t, err)
+	victimRef := victim.(*immutableRef)
+	require.NotEqual(t, expectedBlobChainID, victimRef.getBlobChainID())
+	require.Equal(t, expectedChainID, victimRef.getChainID())
+	require.NotEqual(t, merged.ID(), victim.ID())
+	require.NotEqual(t, mergedRef.getSnapshotID(), victimRef.getSnapshotID())
+}
+
+func TestUnlazyLayerRemovesActiveSnapshotOnDiffIDMismatch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+	cmm := co.manager.(*cacheManager)
+
+	b, desc, err := mapToBlob(map[string]string{"foo": "attacker"}, true)
+	require.NoError(t, err)
+	_, expectedDesc, err := mapToBlob(map[string]string{"foo": "victim"}, true)
+	require.NoError(t, err)
+	desc.Annotations[labels.LabelUncompressed] = expectedDesc.Annotations[labels.LabelUncompressed]
+
+	err = content.WriteBlob(ctx, co.cs, "mismatched", bytes.NewBuffer(b), desc)
+	require.NoError(t, err)
+
+	ref, err := cm.GetByBlob(ctx, desc, nil)
+	require.NoError(t, err)
+
+	err = ref.Extract(ctx, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to verify layer")
+
+	var active []string
+	err = cmm.Snapshotter.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
+		if info.Kind == snapshots.KindActive && strings.HasPrefix(info.Name, "extract-") {
+			active = append(active, info.Name)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Empty(t, active)
+}
+
+func TestUnlazyLayerOverlaybdUsesSnapshotID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(t.TempDir(), "snapshots"))
+	require.NoError(t, err)
+	recordingSnapshotter := &prepareLabelSnapshotter{Snapshotter: snapshotter}
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotter:     recordingSnapshotter,
+		snapshotterName: "overlaybd",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	blob, desc, err := mapToBlob(map[string]string{"foo": "bar"}, true)
+	require.NoError(t, err)
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "overlaybd", bytes.NewReader(blob), desc))
+
+	ref, err := co.manager.GetByBlob(ctx, desc, nil)
+	require.NoError(t, err)
+	immutable := ref.(*immutableRef)
+	require.NotEqual(t, immutable.getChainID().String(), immutable.getSnapshotID())
+
+	require.NoError(t, immutable.unlazyLayer(ctx, nil, nil, nil, false))
+	_, err = co.manager.(*cacheManager).Snapshotter.Stat(ctx, immutable.getSnapshotID())
+	require.NoError(t, err)
+	require.Equal(t, immutable.getSnapshotID(), recordingSnapshotter.getSnapshotRef())
 }
 
 func TestMergeBlobchainID(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -437,13 +795,116 @@ func TestMergeBlobchainID(t *testing.T) {
 	require.Equal(t, mergeRef.ID(), blobRef.ID())
 }
 
+func TestMergeChainIDIncludesStargzTOC(t *testing.T) {
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "stargz",
+	})
+	require.NoError(t, err)
+	firstCleanup := cleanup
+	firstCleanupDone := false
+	t.Cleanup(func() {
+		if !firstCleanupDone {
+			firstCleanup()
+		}
+	})
+
+	baseBlob, baseDesc, err := mapToBlob(map[string]string{"base": "base"}, true)
+	require.NoError(t, err)
+	attackerBlob, attackerDesc, err := mapToBlob(map[string]string{"proof": "attacker"}, true)
+	require.NoError(t, err)
+	_, victimDesc, err := mapToBlob(map[string]string{"proof": "victim"}, true)
+	require.NoError(t, err)
+
+	layerDiffID := digest.Digest(victimDesc.Annotations[labels.LabelUncompressed])
+	tocDigest := digest.FromBytes([]byte("attacker TOC"))
+	attackerDesc.Annotations[labels.LabelUncompressed] = layerDiffID.String()
+	attackerDesc.Annotations[estargz.TOCJSONDigestAnnotation] = tocDigest.String()
+	victimDesc.Digest = attackerDesc.Digest
+	victimDesc.Size = attackerDesc.Size
+	victimDesc.MediaType = attackerDesc.MediaType
+
+	contentBuffer := contentutil.NewBuffer()
+	for _, blob := range [][]byte{baseBlob, attackerBlob} {
+		cw, err := contentBuffer.Writer(ctx)
+		require.NoError(t, err)
+		_, err = cw.Write(blob)
+		require.NoError(t, err)
+		require.NoError(t, cw.Commit(ctx, 0, cw.Digest()))
+	}
+	descHandler := &DescHandler{
+		Provider: func(_ session.Group) content.Provider { return contentBuffer },
+	}
+	descHandlers := DescHandlers{
+		baseDesc.Digest:     descHandler,
+		attackerDesc.Digest: descHandler,
+	}
+
+	base, err := co.manager.GetByBlob(ctx, baseDesc, nil, descHandlers, CachePolicyRetain)
+	require.NoError(t, err)
+	attacker, err := co.manager.GetByBlob(ctx, attackerDesc, base, descHandlers, CachePolicyRetain)
+	require.NoError(t, err)
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "base", bytes.NewReader(baseBlob), baseDesc))
+	require.NoError(t, content.WriteBlob(ctx, co.cs, "attacker", bytes.NewReader(attackerBlob), attackerDesc))
+	baseID := base.ID()
+	attackerID := attacker.ID()
+
+	firstCleanup()
+	firstCleanupDone = true
+
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "stargz",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	base, err = co.manager.Get(ctx, baseID, nil, descHandlers)
+	require.NoError(t, err)
+	attacker, err = co.manager.Get(ctx, attackerID, nil, descHandlers)
+	require.NoError(t, err)
+
+	diff, err := co.manager.Diff(ctx, base, attacker, nil)
+	require.NoError(t, err)
+	merged, err := co.manager.Merge(ctx, []ImmutableRef{base, diff}, nil)
+	require.NoError(t, err)
+	_, err = merged.GetRemotes(ctx, true, config.RefConfig{Compression: compression.New(compression.Default)}, false, nil)
+	require.NoError(t, err)
+
+	baseDiffID := digest.Digest(baseDesc.Annotations[labels.LabelUncompressed])
+	attackerIdentity := imagespecidentity.ChainID([]digest.Digest{layerDiffID, tocDigest})
+	expectedMergeChainID := imagespecidentity.ChainID([]digest.Digest{baseDiffID, attackerIdentity})
+	require.Equal(t, attackerIdentity, attacker.(*immutableRef).getLayerIdentity())
+	require.Equal(t, expectedMergeChainID, attacker.(*immutableRef).getChainID())
+	require.Equal(t, expectedMergeChainID, diff.(*immutableRef).getChainID())
+	require.Equal(t, expectedMergeChainID, merged.(*immutableRef).getChainID())
+
+	victim, err := co.manager.GetByBlob(ctx, victimDesc, base, descHandlers)
+	require.NoError(t, err)
+	require.Equal(t, merged.(*immutableRef).getBlobChainID(), victim.(*immutableRef).getBlobChainID())
+	require.NotEqual(t, merged.ID(), victim.ID())
+	require.NotEqual(t, merged.(*immutableRef).getChainID(), victim.(*immutableRef).getChainID())
+	require.NotEqual(t, merged.(*immutableRef).getSnapshotID(), victim.(*immutableRef).getSnapshotID())
+}
+
 func TestSnapshotExtract(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -518,7 +979,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	id := snap.ID()
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	buf = pruneResultBuffer()
@@ -537,7 +998,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	err = snap2.Release(context.TODO())
+	err = snap2.Release(t.Context())
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 1, 1)
@@ -557,7 +1018,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkNumBlobs(ctx, t, co.cs, 1)
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	buf = pruneResultBuffer()
@@ -574,13 +1035,63 @@ func TestSnapshotExtract(t *testing.T) {
 	checkNumBlobs(ctx, t, co.cs, 0)
 }
 
+func TestMissingMaterializedLowerDiffExtract(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	var refs []ImmutableRef
+	for i, files := range []map[string]string{
+		{"lower": "lower"},
+		{"upper": "upper"},
+	} {
+		blob, desc, err := mapToBlob(files, true)
+		require.NoError(t, err)
+		require.NoError(t, content.WriteBlob(ctx, co.cs, fmt.Sprintf("missing-snapshot-%d", i), bytes.NewBuffer(blob), desc))
+
+		ref, err := cm.GetByBlob(ctx, desc, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, ref.Release(context.WithoutCancel(ctx)))
+		})
+		refs = append(refs, ref)
+	}
+
+	require.NoError(t, refs[0].Extract(ctx, nil))
+	require.NoError(t, refs[1].Extract(ctx, nil))
+	require.False(t, refs[0].(*immutableRef).getBlobOnly())
+	diff, err := cm.Diff(ctx, refs[0], refs[1], nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, diff.Release(context.WithoutCancel(ctx)))
+	})
+
+	lowerID := refs[0].(*immutableRef).getSnapshotID()
+	require.NoError(t, co.testSnapshotter.Remove(ctx, lowerID))
+
+	_, err = co.testSnapshotter.Stat(ctx, lowerID)
+	require.ErrorIs(t, err, cerrdefs.ErrNotFound)
+
+	require.NoError(t, diff.Extract(ctx, nil))
+	_, err = co.testSnapshotter.Stat(ctx, lowerID)
+	require.NoError(t, err)
+}
+
 func TestExtractOnMutable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -621,7 +1132,7 @@ func TestExtractOnMutable(t *testing.T) {
 	require.NoError(t, err)
 
 	err = snap.(*immutableRef).setBlob(leaseCtx, desc)
-	done(context.TODO())
+	done(t.Context())
 	require.NoError(t, err)
 	err = snap.(*immutableRef).computeChainMetadata(leaseCtx, map[string]struct{}{snap.ID(): {}})
 	require.NoError(t, err)
@@ -629,7 +1140,7 @@ func TestExtractOnMutable(t *testing.T) {
 	snap2, err := cm.GetByBlob(ctx, desc2, snap)
 	require.NoError(t, err)
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, false, !snap2.(*immutableRef).getBlobOnly())
@@ -663,7 +1174,7 @@ func TestExtractOnMutable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, len(dirs))
 
-	err = snap2.Release(context.TODO())
+	err = snap2.Release(t.Context())
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 0, 2)
@@ -686,7 +1197,7 @@ func TestExtractOnMutable(t *testing.T) {
 
 func TestSetBlob(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -705,7 +1216,7 @@ func TestSetBlob(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	cm := co.manager
 
@@ -724,7 +1235,7 @@ func TestSetBlob(t *testing.T) {
 
 	ctx, clean, err := leaseutil.WithLease(ctx, co.lm)
 	require.NoError(t, err)
-	defer clean(context.TODO())
+	defer clean(t.Context())
 
 	b, desc, err := mapToBlob(map[string]string{"foo": "bar"}, true)
 	require.NoError(t, err)
@@ -747,6 +1258,7 @@ func TestSetBlob(t *testing.T) {
 
 	snapRef = snap.(*immutableRef)
 	require.Equal(t, desc.Annotations[labels.LabelUncompressed], string(snapRef.getDiffID()))
+	require.Equal(t, snapRef.getDiffID(), snapRef.getLayerIdentity())
 	require.Equal(t, desc.Digest, snapRef.getBlob())
 	require.Equal(t, desc.MediaType, snapRef.getMediaType())
 	require.Equal(t, snapRef.getDiffID(), snapRef.getChainID())
@@ -795,7 +1307,7 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc3.MediaType, snapRef3.getMediaType())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getChainID()+" "+snapRef3.getDiffID())), snapRef3.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef.getBlobChainID()+" "+digest.FromBytes([]byte(desc3.Digest+" "+snapRef3.getDiffID())))), snapRef3.getBlobChainID())
-	require.Equal(t, string(snapRef3.getChainID()), snapRef3.getSnapshotID())
+	require.Equal(t, snapshot.LayerSnapshotID(snapRef3.getChainID()), snapRef3.getSnapshotID())
 	require.Equal(t, false, !snapRef3.getBlobOnly())
 
 	// snap4 is same as snap2
@@ -841,7 +1353,7 @@ func TestSetBlob(t *testing.T) {
 	require.Equal(t, desc6.Digest, snapRef6.getBlob())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getChainID()+" "+snapRef6.getDiffID())), snapRef6.getChainID())
 	require.Equal(t, digest.FromBytes([]byte(snapRef3.getBlobChainID()+" "+digest.FromBytes([]byte(snapRef6.getBlob()+" "+snapRef6.getDiffID())))), snapRef6.getBlobChainID())
-	require.Equal(t, string(snapRef6.getChainID()), snapRef6.getSnapshotID())
+	require.Equal(t, snapshot.LayerSnapshotID(snapRef6.getChainID()), snapRef6.getSnapshotID())
 	require.Equal(t, false, !snapRef6.getBlobOnly())
 
 	_, err = cm.GetByBlob(ctx, ocispecs.Descriptor{
@@ -852,14 +1364,14 @@ func TestSetBlob(t *testing.T) {
 	}, snap3)
 	require.Error(t, err)
 
-	clean(context.TODO())
+	clean(t.Context())
 
 	// snap.SetBlob()
 }
 
 func TestPrune(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -971,7 +1483,7 @@ func TestPrune(t *testing.T) {
 func TestLazyCommit(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1130,7 +1642,7 @@ func TestLoopLeaseContent(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1245,7 +1757,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1280,7 +1792,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		}
 	}
 
-	t.Logf("Test cases with possible compression types")
+	t.Log("Test cases with possible compression types")
 	do(func(testCase testCaseSharingCompressionVariant) {
 		testCase.checkPrune = true
 		testSharingCompressionVariant(ctx, t, co, testCase)
@@ -1288,7 +1800,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		checkDiskUsage(ctx, t, co.manager, 0, 0)
 	})
 
-	t.Logf("Test case with many parallel operation")
+	t.Log("Test case with many parallel operation")
 	eg, egctx := errgroup.WithContext(ctx)
 	do(func(testCase testCaseSharingCompressionVariant) {
 		eg.Go(func() error {
@@ -1409,7 +1921,7 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 			checkCompression(bDesc, c)
 		}
 
-		// check if compression variables are availalbe on B still after A is released
+		// check if compression variables are available on B still after A is released
 		if testCase.checkPrune && aRef.ID() != bRef.ID() {
 			require.NoError(t, aRef.Release(ctx))
 			ensurePrune(ctx, t, cm, 1, 10)
@@ -1511,7 +2023,7 @@ func TestConversion(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1606,7 +2118,7 @@ func TestGetRemotes(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1623,7 +2135,7 @@ func TestGetRemotes(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	contentBuffer := contentutil.NewBuffer()
 
@@ -1750,7 +2262,7 @@ func TestGetRemotes(t *testing.T) {
 					case compression.EStargz:
 						require.Equal(t, ocispecs.MediaTypeImageLayerGzip, desc.MediaType)
 					case compression.Zstd:
-						require.Equal(t, ocispecs.MediaTypeImageLayer+"+zstd", desc.MediaType)
+						require.Equal(t, ocispecs.MediaTypeImageLayerZstd, desc.MediaType)
 					default:
 						require.Fail(t, "unhandled media type", compressionType)
 					}
@@ -1908,7 +2420,7 @@ func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVari
 func TestNondistributableBlobs(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1926,7 +2438,7 @@ func TestNondistributableBlobs(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	contentBuffer := contentutil.NewBuffer()
 	descHandlers := DescHandlers(map[digest.Digest]*DescHandler{})
@@ -2037,7 +2549,7 @@ func TestMergeOp(t *testing.T) {
 	// Tests for the fs merge logic are in client_test and snapshotter_test.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2155,7 +2667,7 @@ func TestDiffOp(t *testing.T) {
 	// Tests for the fs diff logic are in client_test and snapshotter_test.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2257,7 +2769,7 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 	// removed and the immutable ref will continue to be usable.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2338,7 +2850,7 @@ func TestMountReadOnly(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2404,7 +2916,7 @@ func TestLoadBrokenParents(t *testing.T) {
 	// of other parent refs
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2670,6 +3182,19 @@ func mapToBlob(m map[string]string, compress bool) ([]byte, ocispecs.Descriptor,
 }
 
 func mapToBlobWithCompression(m map[string]string, compress func(io.Writer) (io.WriteCloser, string, error)) ([]byte, ocispecs.Descriptor, error) {
+	return mapToBlobWithCompressionAndFileMode(m, compress, 0)
+}
+
+func mapToBlobWithFileMode(m map[string]string, compress bool, mode int64) ([]byte, ocispecs.Descriptor, error) {
+	if !compress {
+		return mapToBlobWithCompressionAndFileMode(m, nil, mode)
+	}
+	return mapToBlobWithCompressionAndFileMode(m, func(w io.Writer) (io.WriteCloser, string, error) {
+		return gzip.NewWriter(w), ocispecs.MediaTypeImageLayerGzip, nil
+	}, mode)
+}
+
+func mapToBlobWithCompressionAndFileMode(m map[string]string, compress func(io.Writer) (io.WriteCloser, string, error), mode int64) ([]byte, ocispecs.Descriptor, error) {
 	buf := bytes.NewBuffer(nil)
 	sha := digest.SHA256.Digester()
 
@@ -2688,6 +3213,7 @@ func mapToBlobWithCompression(m map[string]string, compress func(io.Writer) (io.
 		if err := tw.WriteHeader(&tar.Header{
 			Name: k,
 			Size: int64(len(v)),
+			Mode: mode,
 		}); err != nil {
 			return nil, ocispecs.Descriptor{}, err
 		}
@@ -2775,7 +3301,7 @@ func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Des
 		}
 	}
 
-	cmd := exec.CommandContext(context.TODO(), "tar", "-C", tmpdir, "-c", ".")
+	cmd := exec.CommandContext(t.Context(), "tar", "-C", tmpdir, "-c", ".")
 	tarout, err := cmd.Output()
 	if err != nil {
 		return nil, ocispecs.Descriptor{}, err

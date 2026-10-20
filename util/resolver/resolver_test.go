@@ -66,3 +66,38 @@ mirrors = ["https://url/", "https://url/path/"]
 		}
 	}
 }
+
+func TestGitpodRegistryMirror(t *testing.T) {
+	cfg, err := config.Load(bytes.NewBufferString(`
+[registry."example.com"]
+mirrors = ["other-mirror.example.com"]
+`))
+	require.NoError(t, err)
+	hosts := NewRegistryConfig(cfg.Registries)
+
+	for _, name := range []string{"example.com", "unconfigured.example.com", "docker.io"} {
+		t.Run(name, func(t *testing.T) {
+			registries, err := hosts(name)
+			require.NoError(t, err)
+			require.Len(t, registries, 2)
+			require.Equal(t, "localhost:8080", registries[0].Host)
+			require.Equal(t, "http", registries[0].Scheme)
+			require.Equal(t, defaultPath, registries[0].Path)
+			origin := name
+			if name == "docker.io" {
+				origin = "registry-1.docker.io"
+			}
+			require.Equal(t, origin, registries[1].Host)
+		})
+	}
+
+	for _, name := range []string{"localhost:5000", "127.0.0.1:5000", "[::1]:5000"} {
+		t.Run(name, func(t *testing.T) {
+			registries, err := hosts(name)
+			require.NoError(t, err)
+			require.Len(t, registries, 1)
+			require.Equal(t, name, registries[0].Host)
+			require.Equal(t, "http", registries[0].Scheme)
+		})
+	}
+}

@@ -3,7 +3,6 @@ package dockerfile
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
@@ -58,10 +57,6 @@ FROM second AS binary
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
 
 	called := false
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
@@ -191,7 +186,7 @@ COPY Dockerfile Dockerfile
 func unmarshalTargets(res *gateway.Result) (*targets.List, error) {
 	dt, ok := res.Metadata["result.json"]
 	if !ok {
-		return nil, errors.Errorf("missing frontend.outline")
+		return nil, errors.New("missing frontend.outline")
 	}
 	var l targets.List
 	if err := json.Unmarshal(dt, &l); err != nil {

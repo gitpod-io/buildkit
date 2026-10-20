@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/containerd/platforms"
-	"github.com/mitchellh/hashstructure/v2"
+	"github.com/gohugoio/hashstructure"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -23,6 +23,7 @@ import (
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/network"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
@@ -39,6 +40,8 @@ type llbBridge struct {
 	cms                       map[string]solver.CacheManager
 	cmsMu                     sync.Mutex
 	sm                        *session.Manager
+	provenanceStore           *provenanceStore
+	proxyNetwork              bool
 
 	executorOnce sync.Once
 	executorErr  error
@@ -139,7 +142,7 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 	}
 	dpc := &detectPrunedCacheID{}
 
-	edge, err := Load(ctx, def, b.policy(polEngine), dpc.Load, ValidateEntitlements(ent, w.CDIManager()), WithCacheSources(cms), NormalizeRuntimePlatforms(), WithValidateCaps())
+	edge, err := loadWithProxyNetwork(ctx, def, b.policy(polEngine), b.proxyNetwork, dpc.Load, ValidateEntitlements(ent, w.CDIManager()), WithCacheSources(cms), NormalizeRuntimePlatforms(), WithValidateCaps(), WithLinuxResourcesMetadata())
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to load LLB")
 	}
@@ -160,16 +163,31 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 }
 
 func (b *llbBridge) policy(engine *sourcepolicy.Engine) SourcePolicyEvaluator {
+	if engine == nil {
+		return nil
+	}
 	return &policyEvaluator{
 		llbBridge: b,
 		engine:    engine,
 	}
 }
 
-func (b *llbBridge) validateEntitlements(p executor.ProcessInfo) error {
+func (b *llbBridge) validateEntitlements(p *executor.ProcessInfo) error {
 	ent, err := loadEntitlements(b.builder)
 	if err != nil {
 		return err
+	}
+	if b.proxyNetwork {
+		switch p.Meta.NetMode {
+		case pb.NetMode_UNSET, pb.NetMode_HOST:
+			if p.Meta.Proxy == nil {
+				p.Meta.Proxy = &network.ProxyConfig{}
+			}
+		case pb.NetMode_NONE:
+			p.Meta.Proxy = nil
+		default:
+			return errors.Errorf("network mode %s is not allowed when proxy network is enabled", p.Meta.NetMode)
+		}
 	}
 	v := entitlements.Values{
 		NetworkHost:      p.Meta.NetMode == pb.NetMode_HOST,
@@ -179,8 +197,15 @@ func (b *llbBridge) validateEntitlements(p executor.ProcessInfo) error {
 }
 
 func (b *llbBridge) Run(ctx context.Context, id string, rootfs executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (resourcestypes.Recorder, error) {
-	if err := b.validateEntitlements(process); err != nil {
+	if err := b.validateEntitlements(&process); err != nil {
 		return nil, err
+	}
+	policy, err := b.ProxyPolicy()
+	if err != nil {
+		return nil, err
+	}
+	if policy != nil && process.Meta.Proxy != nil {
+		process.Meta.Proxy.Policy = policy
 	}
 
 	if err := b.loadExecutor(); err != nil {
@@ -190,8 +215,15 @@ func (b *llbBridge) Run(ctx context.Context, id string, rootfs executor.Mount, m
 }
 
 func (b *llbBridge) Exec(ctx context.Context, id string, process executor.ProcessInfo) error {
-	if err := b.validateEntitlements(process); err != nil {
+	if err := b.validateEntitlements(&process); err != nil {
 		return err
+	}
+	policy, err := b.ProxyPolicy()
+	if err != nil {
+		return err
+	}
+	if policy != nil && process.Meta.Proxy != nil {
+		process.Meta.Proxy.Policy = policy
 	}
 
 	if err := b.loadExecutor(); err != nil {
@@ -250,6 +282,7 @@ func (b *llbBridge) resolveSourceMetadata(ctx context.Context, op *pb.SourceOp, 
 	engine := sourcepolicy.NewEngine(opt.SourcePolicies)
 
 	if !withPolicy {
+		op.Identifier = normalizedSourceIdentifier(w, op)
 		if _, err := engine.Evaluate(ctx, op); err != nil {
 			return nil, errors.Wrap(err, "could not resolve image due to policy")
 		}
@@ -353,7 +386,7 @@ func cmKey(im gw.CacheOptionsEntry) (string, error) {
 	if im.Type == "registry" && im.Attrs["ref"] != "" {
 		return im.Attrs["ref"], nil
 	}
-	i, err := hashstructure.Hash(im, hashstructure.FormatV2, nil)
+	i, err := hashstructure.Hash(im, nil)
 	if err != nil {
 		return "", err
 	}

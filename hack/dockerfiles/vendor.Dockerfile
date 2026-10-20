@@ -2,7 +2,6 @@
 
 ARG GO_VERSION=1.26
 ARG ALPINE_VERSION=3.23
-ARG MODOUTDATED_VERSION=v0.9.0
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS base
 RUN apk add --no-cache git rsync
@@ -38,11 +37,8 @@ RUN --mount=target=/context \
   fi
 EOT
 
-FROM --platform=linux/amd64 psampaz/go-mod-outdated:${MODOUTDATED_VERSION} AS go-mod-outdated-amd64
-
-FROM go-mod-outdated-amd64 AS go-mod-outdated
-FROM base AS outdated
+FROM base AS gomod-updates
 RUN --mount=target=.,rw \
   --mount=target=/go/pkg/mod,type=cache \
-  --mount=from=go-mod-outdated,source=/usr/bin/go-mod-outdated,target=/usr/bin/go-mod-outdated \
-  go list -mod=mod -u -m -json all | go-mod-outdated -update -direct
+  --mount=from=crazymax/gomod-updates,source=/usr/bin/gomod-updates,target=/usr/bin/gomod-updates \
+  gomod-updates --update --direct --major

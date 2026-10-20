@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/containerd/continuity/fs"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/attestation"
 	"github.com/moby/buildkit/exporter/util/epoch"
@@ -33,12 +34,15 @@ const (
 	// keyPlatformSplit is an exporter option which can be used to split result
 	// in subfolders when multiple platform references are exported.
 	keyPlatformSplit = "platform-split"
+	keyMode          = "mode"
+	keySource        = "src"
 )
 
 type CreateFSOpts struct {
 	Epoch             *epoch.Epoch
 	AttestationPrefix string
 	PlatformSplit     *bool
+	Source            string
 }
 
 func (c *CreateFSOpts) UsePlatformSplit(isMap bool) bool {
@@ -67,12 +71,57 @@ func (c *CreateFSOpts) Load(opt map[string]string) (map[string]string, error) {
 				return nil, errors.Wrapf(err, "non-bool value for %s: %s", keyPlatformSplit, v)
 			}
 			c.PlatformSplit = &b
+		case keyMode:
+			if _, err := client.ParseLocalExporterMode(v); err != nil {
+				return nil, err
+			}
+		case keySource:
+			if v == "" {
+				return nil, errors.Errorf("empty value for %s; omit it to export the entire filesystem", keySource)
+			}
+			c.Source = v
 		default:
 			rest[k] = v
 		}
 	}
 
 	return rest, nil
+}
+
+// resolveSafeSource resolves source inside mountRoot and prevents path traversal.
+// An empty source returns mountRoot itself.
+func resolveSafeSource(mountRoot, source string) (fsutil.FS, error) {
+	// RootPath must see the original path so it can resolve symlinks before "..".
+	// The mounted ref must remain read-only while the returned FS is in use.
+	root, err := fs.RootPath(mountRoot, source)
+	if err != nil {
+		return nil, sourceError(err, source)
+	}
+
+	outputFS, err := fsutil.NewFS(root)
+	if err != nil {
+		return nil, sourceError(err, source)
+	}
+
+	return outputFS, nil
+}
+
+// sourceError reports err against the source the client asked for, hiding the
+// daemon-side mountpoint that RootPath and NewFS name.
+func sourceError(err error, source string) error {
+	if source == "" {
+		return err
+	}
+	// the innermost *os.PathError carries the bare syscall error, with no path
+	cause := err
+	for {
+		var pe *os.PathError
+		if !errors.As(cause, &pe) {
+			break
+		}
+		cause = pe.Err
+	}
+	return errors.Wrapf(cause, "%s=%s", keySource, source)
 }
 
 func CreateFS(ctx context.Context, sessionID string, k string, ref cache.ImmutableRef, attestations []exporter.Attestation, defaultTime time.Time, isMap bool, opt CreateFSOpts) (fsutil.FS, func() error, error) {
@@ -103,8 +152,14 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 
 		cleanup = lm.Unmount
 	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError && cleanup != nil {
+			_ = cleanup()
+		}
+	}()
 
-	outputFS, err := fsutil.NewFS(src)
+	outputFS, err := resolveSafeSource(src, opt.Source)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -149,7 +204,7 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 	}
 	if len(attestations) > 0 {
 		subjects := []intoto.Subject{}
-		err = outputFS.Walk(ctx, "", func(path string, entry fs.DirEntry, err error) error {
+		err = outputFS.Walk(ctx, "", func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -193,7 +248,7 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 			if addPlatformToFilename {
 				nameExt := path.Ext(name)
 				namBase := strings.TrimSuffix(name, nameExt)
-				name = fmt.Sprintf("%s.%s%s", namBase, strings.ReplaceAll(k, "/", "_"), nameExt)
+				name = fmt.Sprintf("%s.%s%s", namBase, PlatformIDToPath(k), nameExt)
 			}
 			if _, ok := names[name]; ok {
 				return nil, nil, errors.Errorf("duplicate attestation path name %s", name)
@@ -214,5 +269,6 @@ func CreateFS(ctx context.Context, sessionID string, k string, ref cache.Immutab
 		outputFS = staticfs.NewMergeFS(outputFS, stmtFS)
 	}
 
+	releaseOnError = false
 	return outputFS, cleanup, nil
 }

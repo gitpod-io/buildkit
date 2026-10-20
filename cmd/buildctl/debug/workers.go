@@ -15,30 +15,32 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/tonistiigi/units"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 )
 
-var WorkersCommand = cli.Command{
+var WorkersCommand = &cli.Command{
 	Name:   "workers",
 	Usage:  "list workers",
-	Action: listWorkers,
+	Action: commandAction(listWorkers),
 	Flags: []cli.Flag{
-		cli.StringSliceFlag{
-			Name:  "filter, f",
-			Usage: "containerd-style filter string slice",
+		&cli.StringSliceFlag{
+			Name:    "filter",
+			Aliases: []string{"f"},
+			Usage:   "containerd-style filter string slice",
 		},
-		cli.BoolFlag{
-			Name:  "verbose, v",
-			Usage: "Verbose output",
+		&cli.BoolFlag{
+			Name:    "verbose",
+			Aliases: []string{"v"},
+			Usage:   "Verbose output",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "format",
 			Usage: "Format the output using the given Go template, e.g, '{{json .}}'",
 		},
 	},
 }
 
-func listWorkers(clicontext *cli.Context) error {
+func listWorkers(clicontext *cli.Command) error {
 	c, err := bccommon.ResolveClient(clicontext)
 	if err != nil {
 		return err
@@ -56,10 +58,10 @@ func listWorkers(clicontext *cli.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := tmpl.Execute(clicontext.App.Writer, workers); err != nil {
+		if err := tmpl.Execute(clicontext.Root().Writer, workers); err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(clicontext.App.Writer, "\n")
+		_, err = fmt.Fprint(clicontext.Root().Writer, "\n")
 		return err
 	}
 
@@ -78,7 +80,10 @@ func printWorkersVerbose(tw *tabwriter.Writer, winfo []*client.WorkerInfo) {
 		fmt.Fprintf(tw, "ID:\t%s\n", wi.ID)
 		fmt.Fprintf(tw, "Platforms:\t%s\n", joinPlatforms(wi.Platforms))
 		fmt.Fprintf(tw, "BuildKit:\t%s %s %s\n", wi.BuildkitVersion.Package, wi.BuildkitVersion.Version, wi.BuildkitVersion.Revision)
-		fmt.Fprintf(tw, "Labels:\n")
+		if wi.BuildkitVersion.DockerfileVersion != "" {
+			fmt.Fprintf(tw, "Dockerfile:\t%s\n", wi.BuildkitVersion.DockerfileVersion)
+		}
+		fmt.Fprint(tw, "Labels:\n")
 		for _, k := range sortedKeys(wi.Labels) {
 			v := wi.Labels[k]
 			fmt.Fprintf(tw, "\t%s:\t%s\n", k, v)
@@ -119,7 +124,7 @@ func printWorkersVerbose(tw *tabwriter.Writer, winfo []*client.WorkerInfo) {
 				fmt.Fprintf(tw, "\tMaximum used space:\t%g\n", units.Bytes(rule.MaxUsedSpace))
 			}
 		}
-		fmt.Fprintf(tw, "\n")
+		fmt.Fprint(tw, "\n")
 	}
 
 	tw.Flush()
@@ -140,8 +145,8 @@ func sortedKeys[T any](m map[string]T) []string {
 	return slices.Sorted(maps.Keys(m))
 }
 
-func commandContext(c *cli.Context) context.Context {
-	return c.App.Metadata["context"].(context.Context)
+func commandContext(c *cli.Command) context.Context {
+	return c.Root().Metadata["context"].(context.Context)
 }
 
 func joinPlatforms(p []ocispecs.Platform) string {

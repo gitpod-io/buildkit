@@ -1,0 +1,81 @@
+name: compatibility-releases
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+on:
+  # Historical upstream daemons are outside the Gitpod fork's supported scope.
+  # Keep this matrix available for an explicit investigation.
+  workflow_dispatch:
+
+env:
+  SETUP_BUILDX_VERSION: "edge"
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
+  TEST_IMAGE_NAME: "buildkit-compatibility-tests"
+  CACHE_SCOPE: "build-integration-tests"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Generate matrix
+        id: matrix
+        run: |
+          echo "matrix=$(./hack/test-compatibility-releases --matrix)" >> "$GITHUB_OUTPUT"
+
+  compatibility:
+    needs:
+      - prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Expose GitHub Runtime
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        name: Build integration-tests-base
+        uses: ./.github/actions/retry-go-network
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          command: |
+            docker buildx bake --progress=plain integration-tests-base \
+              --set '*.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}' \
+              --set "*.cache-to=type=gha,scope=${{ env.CACHE_SCOPE }},repository=${GITHUB_REPOSITORY},ghtoken=${GITHUB_TOKEN}"
+      -
+        name: Build test image
+        uses: ./.github/actions/retry-go-network
+        with:
+          command: |
+            docker buildx bake --progress=plain integration-tests \
+              --set '*.cache-from=type=gha,scope=${{ env.CACHE_SCOPE }}'
+      -
+        name: Test compatibility releases
+        env:
+          COMPATIBILITY_RELEASES: ${{ matrix.compatibility_release }}
+          TEST_IMAGE_BUILD: "0"
+          TEST_IMAGE_NAME: ${{ env.TEST_IMAGE_NAME }}
+        run: |
+          ./hack/test-compatibility-releases

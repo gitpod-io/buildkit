@@ -8,6 +8,7 @@ import (
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/db"
 	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/db/compaction"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
@@ -24,10 +25,12 @@ type Store struct {
 	db db.DB
 }
 
-func NewStore(dbPath string) (*Store, error) {
+func NewStore(dbPath string, policies ...compaction.Config) (*Store, error) {
 	db, err := boltutil.SafeOpen(dbPath, 0600, &bolt.Options{
-		NoSync: true,
-	})
+		NoSync:         true,
+		FreelistType:   bolt.FreelistMapType,
+		NoFreelistSync: true,
+	}, policies...)
 	if err != nil {
 		return nil, err
 	}
@@ -41,6 +44,7 @@ func NewStore(dbPath string) (*Store, error) {
 		}
 		return nil
 	}); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil

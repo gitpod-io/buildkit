@@ -3,8 +3,8 @@
 ARG GO_VERSION=1.26
 ARG ALPINE_VERSION=3.23
 ARG XX_VERSION=1.9.0
-ARG PROTOLINT_VERSION=0.50.5
-ARG GOLANGCI_LINT_VERSION=v2.8.0
+ARG PROTOLINT_VERSION=0.56.4
+ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG GOLANGCI_FROM_SOURCE=false
 ARG GOPLS_VERSION=v0.38.0
 # GOPLS_ANALYZERS defines gopls analyzers to be run. disabled by default: deprecated simplifyrange unusedfunc unusedvariable
@@ -34,7 +34,7 @@ RUN apk add --no-cache gcc musl-dev yamllint
 ARG GOLANGCI_LINT_VERSION
 ARG GOLANGCI_FROM_SOURCE
 COPY --link --from=golangci-binary / /usr/bin/
-RUN [ "${GOLANGCI_FROM_SOURCE}" = "true" ] && exit 0; wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s ${GOLANGCI_LINT_VERSION}
+RUN [ "${GOLANGCI_FROM_SOURCE}" = "true" ] && exit 0; wget -O- -nv https://raw.githubusercontent.com/golangci/golangci-lint/${GOLANGCI_LINT_VERSION}/install.sh | sh -s ${GOLANGCI_LINT_VERSION}
 COPY --link --from=protolint-base /usr/local/bin/protolint /usr/local/bin/protolint
 COPY --link --from=xx / /
 WORKDIR /go/src/github.com/moby/buildkit

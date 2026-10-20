@@ -151,8 +151,9 @@ func (p parentRefs) release(ctx context.Context) error {
 	switch {
 	case p.layerParent != nil:
 		p.layerParent.mu.Lock()
-		defer p.layerParent.mu.Unlock()
-		if err := p.layerParent.release(ctx); err != nil {
+		err := p.layerParent.release(ctx)
+		p.layerParent.mu.Unlock()
+		if err != nil {
 			errs = append(errs, err)
 		}
 	case len(p.mergeParents) > 0:
@@ -171,8 +172,9 @@ func (p parentRefs) release(ctx context.Context) error {
 	case p.diffParents != nil:
 		if p.diffParents.lower != nil {
 			p.diffParents.lower.mu.Lock()
-			defer p.diffParents.lower.mu.Unlock()
-			if err := p.diffParents.lower.release(ctx); err != nil {
+			err := p.diffParents.lower.release(ctx)
+			p.diffParents.lower.mu.Unlock()
+			if err != nil {
 				errs = append(errs, err)
 			} else {
 				p.diffParents.lower = nil
@@ -180,8 +182,9 @@ func (p parentRefs) release(ctx context.Context) error {
 		}
 		if p.diffParents.upper != nil {
 			p.diffParents.upper.mu.Lock()
-			defer p.diffParents.upper.mu.Unlock()
-			if err := p.diffParents.upper.release(ctx); err != nil {
+			err := p.diffParents.upper.release(ctx)
+			p.diffParents.upper.mu.Unlock()
+			if err != nil {
 				errs = append(errs, err)
 			} else {
 				p.diffParents.upper = nil
@@ -1308,21 +1311,57 @@ func (sr *immutableRef) unlazyDiffMerge(ctx context.Context, dhs DescHandlers, p
 // should be called within sizeG.Do call for this ref's ID
 func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg progress.Controller, s session.Group, ensureContentStore bool) (rerr error) {
 	if !sr.getBlobOnly() {
-		return nil
+		// unlazy may reach this path because either the snapshot or content is
+		// missing. Recheck the snapshot to distinguish these cases. If the snapshot
+		// disappeared but the blob remains, re-extract it from the blob.
+		if _, err := sr.cm.Snapshotter.Stat(ctx, sr.getSnapshotID()); err == nil {
+			return nil
+		} else if !cerrdefs.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to stat snapshot %s", sr.getSnapshotID())
+		}
+		if sr.getBlob() == "" {
+			return errors.Errorf("failed to restore missing snapshot %s: no blob available", sr.getSnapshotID())
+		}
 	}
 
 	if sr.cm.Applier == nil {
 		return errors.New("unlazy requires an applier")
 	}
 
-	if _, ok := leases.FromContext(ctx); !ok {
+	leaseID, hasLease := leases.FromContext(ctx)
+	var leaseDone func(context.Context) error
+	if !hasLease {
 		leaseCtx, done, err := leaseutil.WithLease(ctx, sr.cm.LeaseManager, leaseutil.MakeTemporary)
 		if err != nil {
 			return err
 		}
-		defer done(leaseCtx)
 		ctx = leaseCtx
+		leaseID, _ = leases.FromContext(ctx)
+		leaseDone = done
 	}
+
+	removeActive := false
+	var activeKey string
+	defer func() {
+		ctx := context.WithoutCancel(ctx)
+		if leaseDone != nil {
+			if err := leaseDone(ctx); err != nil {
+				bklog.G(ctx).Warn(errors.Wrap(err, "failed to release extraction lease"))
+			}
+		} else if removeActive && leaseID != "" {
+			if err := sr.cm.LeaseManager.DeleteResource(ctx, leases.Lease{ID: leaseID}, leases.Resource{
+				ID:   activeKey,
+				Type: "snapshots/" + sr.cm.Snapshotter.Name(),
+			}); err != nil && !cerrdefs.IsNotFound(err) {
+				bklog.G(ctx).Warn(errors.Wrapf(err, "failed to delete active snapshot %s from lease %s", activeKey, leaseID))
+			}
+		}
+		if removeActive && sr.cm.GarbageCollect != nil {
+			if _, err := sr.cm.GarbageCollect(ctx); err != nil {
+				bklog.G(ctx).Warn(errors.Wrapf(err, "failed to garbage collect active snapshot %s", activeKey))
+			}
+		}
+	}()
 
 	if sr.GetLayerType() == "windows" {
 		ctx = winlayers.UseWindowsLayerMode(ctx)
@@ -1377,16 +1416,19 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 	defer sp.End()
 
 	key := fmt.Sprintf("extract-%s %s", identity.NewID(), sr.getChainID())
+	activeKey = key
 
 	if sr.cm.Snapshotter.Name() == "overlaybd" {
 		err = sr.cm.Snapshotter.Prepare(ctx, key, parentID,
-			snapshots.WithLabels(map[string]string{"containerd.io/snapshot.ref": string(sr.getChainID())}))
+			snapshots.WithLabels(map[string]string{"containerd.io/snapshot.ref": sr.getSnapshotID()}))
 	} else {
 		err = sr.cm.Snapshotter.Prepare(ctx, key, parentID)
 	}
 	if err != nil {
 		return err
 	}
+
+	removeActive = true
 
 	mountable, err := sr.cm.Snapshotter.Mounts(ctx, key)
 	if err != nil {
@@ -1396,10 +1438,14 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 	if err != nil {
 		return err
 	}
-	_, err = sr.cm.Applier.Apply(ctx, desc, mounts)
+	applied, err := sr.cm.Applier.Apply(ctx, desc, mounts)
 	if err != nil {
 		unmount()
 		return err
+	}
+	if applied.Digest != sr.getDiffID() {
+		unmount()
+		return errors.Errorf("failed to verify layer %s: expected diffID %s, got %s", desc.Digest, sr.getDiffID(), applied.Digest)
 	}
 
 	if err := unmount(); err != nil {
@@ -1409,6 +1455,8 @@ func (sr *immutableRef) unlazyLayer(ctx context.Context, dhs DescHandlers, pg pr
 		if !errors.Is(err, cerrdefs.ErrAlreadyExists) {
 			return err
 		}
+	} else {
+		removeActive = false
 	}
 	sr.queueBlobOnly(false)
 	sr.queueSize(sizeUnknown)
@@ -1505,12 +1553,12 @@ func (cr *cacheRecord) finalize(ctx context.Context) error {
 		ID:   cr.getSnapshotID(),
 		Type: "snapshots/" + cr.cm.Snapshotter.Name(),
 	}); err != nil {
-		cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.ID()})
+		_ = cr.cm.LeaseManager.Delete(context.WithoutCancel(ctx), leases.Lease{ID: cr.ID()})
 		return errors.Wrapf(err, "failed to add snapshot %s to lease", cr.getSnapshotID())
 	}
 
 	if err := cr.cm.Snapshotter.Commit(ctx, cr.getSnapshotID(), mutable.getSnapshotID()); err != nil {
-		cr.cm.LeaseManager.Delete(context.TODO(), leases.Lease{ID: cr.ID()})
+		_ = cr.cm.LeaseManager.Delete(context.WithoutCancel(ctx), leases.Lease{ID: cr.ID()})
 		return errors.Wrapf(err, "failed to commit %s to %s during finalize", mutable.getSnapshotID(), cr.getSnapshotID())
 	}
 	cr.mountCache = nil
@@ -1519,8 +1567,9 @@ func (cr *cacheRecord) finalize(ctx context.Context) error {
 	go func() {
 		cr.cm.mu.Lock()
 		defer cr.cm.mu.Unlock()
-		if err := mutable.remove(context.TODO(), true); err != nil {
-			bklog.G(ctx).Error(err)
+		cleanupCtx := context.WithoutCancel(ctx)
+		if err := mutable.remove(cleanupCtx, true); err != nil {
+			bklog.G(cleanupCtx).Error(err)
 		}
 	}()
 

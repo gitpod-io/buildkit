@@ -21,6 +21,9 @@ func generateMountOpts(_, _ string) []oci.SpecOpts {
 
 // generateSecurityOpts may affect mounts, so must be called after generateMountOpts
 func generateSecurityOpts(mode pb.SecurityMode, _ string, _ bool) ([]oci.SpecOpts, error) {
+	if err := pb.ValidateSecurityMode(mode); err != nil {
+		return nil, err
+	}
 	if mode == pb.SecurityMode_INSECURE {
 		return nil, errors.New("no support for running in insecure mode on FreeBSD")
 	}
@@ -70,6 +73,13 @@ func sub(m mount.Mount, subPath string) (mount.Mount, func() error, error) {
 	}
 	m.Source = src
 	return m, func() error { return nil }, nil
+}
+
+func generateLinuxResourceOpts(res *pb.LinuxResources) ([]oci.SpecOpts, error) {
+	if res == nil {
+		return nil, nil
+	}
+	return nil, errors.New("no support for Linux resource limits on FreeBSD")
 }
 
 func generateCDIOpts(_ *cdidevices.Manager, devices []*pb.CDIDevice) ([]oci.SpecOpts, error) {

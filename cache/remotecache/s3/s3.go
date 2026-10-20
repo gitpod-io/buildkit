@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	aws_config "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
@@ -208,20 +208,26 @@ func ResolveCacheExporterFunc() remotecache.ResolveCacheExporterFunc {
 			return nil, err
 		}
 
+		compressionConfig, err := compression.ParseAttributes(attrs)
+		if err != nil {
+			return nil, err
+		}
+
 		s3Client, err := newS3Client(ctx, config)
 		if err != nil {
 			return nil, err
 		}
 		cc := v1.NewCacheChains()
-		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config}, nil
+		return &exporter{CacheExporterTarget: cc, chains: cc, s3Client: s3Client, config: config, compression: compressionConfig}, nil
 	}
 }
 
 type exporter struct {
 	solver.CacheExporterTarget
-	chains   *v1.CacheChains
-	s3Client *s3Client
-	config   Config
+	chains      *v1.CacheChains
+	s3Client    *s3Client
+	config      Config
+	compression compression.Config
 }
 
 func (*exporter) Name() string {
@@ -230,7 +236,7 @@ func (*exporter) Name() string {
 
 func (e *exporter) Config() remotecache.Config {
 	return remotecache.Config{
-		Compression: compression.New(compression.Default),
+		Compression: e.compression,
 	}
 }
 
@@ -438,7 +444,7 @@ func (r *readerAt) Size() int64 {
 
 type s3Client struct {
 	*s3.Client
-	*manager.Uploader
+	transferManager *transfermanager.Client
 	bucket          string
 	prefix          string
 	blobsPrefix     string
@@ -481,8 +487,10 @@ func newS3Client(ctx context.Context, config Config) (*s3Client, error) {
 	})
 
 	return &s3Client{
-		Client:          client,
-		Uploader:        manager.NewUploader(client),
+		Client: client,
+		transferManager: transfermanager.New(client, func(options *transfermanager.Options) {
+			options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}),
 		bucket:          config.Bucket,
 		prefix:          config.Prefix,
 		blobsPrefix:     config.BlobsPrefix,
@@ -533,12 +541,12 @@ func (s3Client *s3Client) getReader(ctx context.Context, key string, offset int6
 }
 
 func (s3Client *s3Client) saveMutableAt(ctx context.Context, key string, body io.Reader) error {
-	input := &s3.PutObjectInput{
+	input := &transfermanager.UploadObjectInput{
 		Bucket: &s3Client.bucket,
 		Key:    &key,
 		Body:   body,
 	}
-	_, err := s3Client.Upload(ctx, input)
+	_, err := s3Client.transferManager.UploadObject(ctx, input)
 	return err
 }
 

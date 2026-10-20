@@ -33,6 +33,7 @@ func InitDockerdWorker() {
 			FeatureCacheBackendS3,
 			FeatureDirectPush,
 			FeatureImageExporter,
+			FeatureMergeDiff,
 			FeatureMultiCacheExport,
 			FeatureMultiPlatform,
 			FeatureOCIExporter,
@@ -130,6 +131,11 @@ func (c Moby) New(ctx context.Context, cfg *integration.BackendConfig) (b integr
 			case "device":
 				dcfg.Builder.Entitlements.Device = true
 			}
+		}
+	}
+	if bkcfg.History != nil && bkcfg.History.MaxEntries != nil {
+		dcfg.Builder.History = &dockerd.BuilderHistoryConfig{
+			MaxEntries: bkcfg.History.MaxEntries,
 		}
 	}
 

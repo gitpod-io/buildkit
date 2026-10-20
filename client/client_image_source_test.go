@@ -1,0 +1,545 @@
+package client
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/platforms"
+	"github.com/containerd/stargz-snapshotter/estargz"
+	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	"github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/session"
+	sessionauth "github.com/moby/buildkit/session/auth"
+	"github.com/moby/buildkit/util/contentutil"
+	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
+	digest "github.com/opencontainers/go-digest"
+	ocispecsversioned "github.com/opencontainers/image-spec/specs-go"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+)
+
+func testClientGatewayCanceledCredentialsCallbackReturns(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+
+	ctx := sb.Context()
+
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	username := "buildkit-user"
+	password := "buildkit-pass"
+	repo := "buildkit/auth-session-" + identity.NewID()
+	backendRef := registry + "/" + repo + ":latest"
+
+	st := llb.Scratch().File(llb.Mkfile("hello", 0o644, []byte("world")))
+	def, err := st.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		Exports: []ExportEntry{{
+			Type: ExporterImage,
+			Attrs: map[string]string{
+				"name": backendRef,
+				"push": "true",
+			},
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	target, err := url.Parse("http://" + registry)
+	require.NoError(t, err)
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Host = target.Host
+		},
+	}
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, secret, ok := r.BasicAuth()
+		if !ok || user != username || secret != password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="buildkit-test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	ref := strings.TrimPrefix(proxyServer.URL, "http://") + "/" + repo + ":latest"
+	host, _, _ := strings.Cut(ref, "/")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+
+	provider := &blockingAuthProvider{
+		t:           t,
+		host:        host,
+		username:    username,
+		password:    password,
+		started:     started,
+		startedOnce: &startedOnce,
+		release:     release,
+	}
+
+	_, err = c.Build(ctx, SolveOpt{
+		Session: []session.Attachable{provider},
+	}, "buildkit_test", func(ctx context.Context, gw client.Client) (*client.Result, error) {
+		reqCtx, cancel := context.WithCancelCause(ctx)
+		defer cancel(context.Canceled)
+
+		errCh := make(chan error, 1)
+		go func() {
+			_, _, _, err := gw.ResolveImageConfig(reqCtx, ref, sourceresolver.Opt{})
+			errCh <- err
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(15 * time.Second):
+			return nil, errors.New("timed out waiting for registry credential callback")
+		}
+
+		cancel(context.Canceled)
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+			return client.NewResult(), nil
+		case <-time.After(3 * time.Second):
+			close(release)
+		}
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+		case <-time.After(15 * time.Second):
+			return nil, errors.New("timed out draining canceled image config resolution")
+		}
+
+		return nil, errors.New("canceled image config resolution stayed blocked until the credentials callback was released")
+	}, nil)
+	require.NoError(t, err)
+
+	checkAllReleasable(t, c, sb, true)
+}
+
+func testPullWithLayerLimit(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	st := llb.Scratch().
+		File(llb.Mkfile("/first", 0644, []byte("first"))).
+		File(llb.Mkfile("/second", 0644, []byte("second"))).
+		File(llb.Mkfile("/third", 0644, []byte("third")))
+
+	def, err := st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	target := registry + "/buildkit/testlayers:latest"
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// pull 2 first layers
+	st = llb.Image(target, llb.WithLayerLimit(2)).
+		File(llb.Mkfile("/forth", 0644, []byte("forth")))
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: destDir,
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "first"))
+	require.NoError(t, err)
+	require.Equal(t, "first", string(dt))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "second"))
+	require.NoError(t, err)
+	require.Equal(t, "second", string(dt))
+
+	_, err = os.ReadFile(filepath.Join(destDir, "third"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, os.ErrNotExist))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "forth"))
+	require.NoError(t, err)
+	require.Equal(t, "forth", string(dt))
+
+	// pull 3rd layer only
+	st = llb.Diff(
+		llb.Image(target, llb.WithLayerLimit(2)),
+		llb.Image(target)).
+		File(llb.Mkfile("/forth", 0644, []byte("forth")))
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir = t.TempDir()
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{{
+			Type:      ExporterLocal,
+			OutputDir: destDir,
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	_, err = os.ReadFile(filepath.Join(destDir, "first"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, os.ErrNotExist))
+
+	_, err = os.ReadFile(filepath.Join(destDir, "second"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, os.ErrNotExist))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "third"))
+	require.NoError(t, err)
+	require.Equal(t, "third", string(dt))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "forth"))
+	require.NoError(t, err)
+	require.Equal(t, "forth", string(dt))
+
+	// zero limit errors cleanly
+	st = llb.Image(target, llb.WithLayerLimit(0))
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid layer limit")
+}
+
+func testBuildWithInvalidChainID(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	originalTarget := registry + "/buildkit/invalid-chainid:original"
+	modifiedTarget := registry + "/buildkit/invalid-chainid:modified"
+
+	def, err := llb.Image("busybox:latest").Marshal(sb.Context())
+	require.NoError(t, err)
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": originalTarget,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+	ensurePruneAll(t, c, sb)
+
+	resolver := docker.NewResolver(docker.ResolverOptions{PlainHTTP: true})
+	ctx := sb.Context()
+	originalName, originalDesc, err := resolver.Resolve(ctx, originalTarget)
+	require.NoError(t, err)
+
+	fetcher, err := resolver.Fetcher(ctx, originalName)
+	require.NoError(t, err)
+	pusher, err := resolver.Pusher(ctx, modifiedTarget)
+	require.NoError(t, err)
+
+	provider := contentutil.FromFetcher(fetcher)
+	originalManifest, err := images.Manifest(ctx, provider, originalDesc, platforms.Default())
+	require.NoError(t, err)
+	require.Len(t, originalManifest.Layers, 1)
+
+	layer, err := content.ReadBlob(ctx, provider, originalManifest.Layers[0])
+	require.NoError(t, err)
+
+	var modifiedLayer bytes.Buffer
+	gw := gzip.NewWriter(&modifiedLayer)
+	tw := tar.NewWriter(gw)
+	gz, err := gzip.NewReader(bytes.NewReader(layer))
+	require.NoError(t, err)
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		if h.Name == "bin/sh" {
+			continue
+		}
+		require.NoError(t, tw.WriteHeader(h))
+		if h.Size > 0 {
+			n, err := io.CopyN(tw, tr, h.Size)
+			require.NoError(t, err)
+			require.Equal(t, h.Size, n)
+		}
+	}
+	require.NoError(t, gz.Close())
+
+	contents := "#!/bin/busybox sh\necho invalid-chainid > /out"
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     "bin/sh",
+		Size:     int64(len(contents)),
+		Mode:     0755,
+	}))
+	_, err = tw.Write([]byte(contents))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	require.NoError(t, gw.Close())
+
+	modifiedLayerData := modifiedLayer.Bytes()
+	modifiedLayerDesc := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageLayerGzip,
+		Digest:    digest.FromBytes(modifiedLayerData),
+		Size:      int64(len(modifiedLayerData)),
+	}
+	if sb.Snapshotter() == "stargz" {
+		esgzR, err := estargz.Build(io.NewSectionReader(bytes.NewReader(modifiedLayerData), 0, int64(len(modifiedLayerData))))
+		require.NoError(t, err)
+		defer esgzR.Close()
+
+		modifiedLayerData, err = io.ReadAll(esgzR)
+		require.NoError(t, err)
+		modifiedLayerDesc = ocispecs.Descriptor{
+			MediaType: ocispecs.MediaTypeImageLayerGzip,
+			Digest:    digest.FromBytes(modifiedLayerData),
+			Size:      int64(len(modifiedLayerData)),
+			Annotations: map[string]string{
+				estargz.TOCJSONDigestAnnotation: esgzR.TOCDigest().String(),
+			},
+		}
+	}
+	ingester, ok := pusher.(content.Ingester)
+	require.True(t, ok)
+	err = content.WriteBlob(ctx, ingester, "invalid-chainid-layer", bytes.NewReader(modifiedLayerData), modifiedLayerDesc)
+	require.NoError(t, err)
+
+	originalConfigDesc, err := images.Config(ctx, provider, originalDesc, platforms.Default())
+	require.NoError(t, err)
+	originalConfigData, err := content.ReadBlob(ctx, provider, originalConfigDesc)
+	require.NoError(t, err)
+	err = content.WriteBlob(ctx, ingester, "invalid-chainid-config", bytes.NewReader(originalConfigData), originalConfigDesc)
+	require.NoError(t, err)
+
+	manifest := &ocispecs.Manifest{
+		Versioned: ocispecsversioned.Versioned{SchemaVersion: 2},
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Config:    originalConfigDesc,
+		Layers:    []ocispecs.Descriptor{modifiedLayerDesc},
+	}
+	manifestBlob, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	manifestDesc := ocispecs.Descriptor{
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Digest:    digest.FromBytes(manifestBlob),
+		Size:      int64(len(manifestBlob)),
+	}
+	err = content.WriteBlob(ctx, ingester, "invalid-chainid-manifest", bytes.NewReader(manifestBlob), manifestDesc)
+	require.NoError(t, err)
+
+	def, err = llb.Image(modifiedTarget).Run(llb.Shlex("true")).Marshal(sb.Context())
+	require.NoError(t, err)
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	if sb.Snapshotter() == "stargz" {
+		require.NoError(t, err)
+	} else {
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to verify layer")
+	}
+
+	def, err = llb.Image(originalTarget).Run(llb.Shlex(`/bin/sh -c "echo hello"`)).Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	_, err = os.ReadFile(filepath.Join(destDir, "out"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, os.ErrNotExist))
+}
+
+func testValidateDigestOrigin(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	imgName := integration.UnixOrWindows("busybox:latest", "nanoserver:latest")
+	scratch := integration.UnixOrWindows(llb.Scratch(), llb.Image(imgName))
+
+	cmdStr := integration.UnixOrWindows(
+		"touch foo",
+		"cmd /C echo a > foo",
+	)
+	st := llb.Image(imgName).
+		Run(llb.Shlex(cmdStr), llb.Dir("/wd")).
+		AddMount("/wd", scratch)
+
+	def, err := st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	target := registry + "/buildkit/testdigest:latest"
+
+	resp, err := c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dgst, ok := resp.ExporterResponse[exptypes.ExporterImageDigestKey]
+	require.True(t, ok)
+
+	err = c.Prune(sb.Context(), nil, PruneAll)
+	require.NoError(t, err)
+
+	st = llb.Image(target + "@" + dgst)
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.NoError(t, err)
+
+	// accessing the digest from invalid names should fail
+	st = llb.Image("example.invalid/nosuchrepo@" + dgst)
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.Error(t, err)
+
+	// also check repo that does exists but not digest
+	st = llb.Image("docker.io/library/ubuntu@" + dgst)
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
+	require.Error(t, err)
+}
+
+type blockingAuthProvider struct {
+	sessionauth.UnimplementedAuthServer
+
+	t           *testing.T
+	host        string
+	username    string
+	password    string
+	started     chan struct{}
+	startedOnce *sync.Once
+	release     chan struct{}
+}
+
+func (p *blockingAuthProvider) Register(server *grpc.Server) {
+	sessionauth.RegisterAuthServer(server, p)
+}
+
+func (p *blockingAuthProvider) Credentials(ctx context.Context, req *sessionauth.CredentialsRequest) (*sessionauth.CredentialsResponse, error) {
+	require.Equal(p.t, p.host, req.Host)
+	p.startedOnce.Do(func() {
+		close(p.started)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	case <-p.release:
+		return &sessionauth.CredentialsResponse{
+			Username: p.username,
+			Secret:   p.password,
+		}, nil
+	}
+}

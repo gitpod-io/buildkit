@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -34,6 +35,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -60,6 +62,7 @@ func (p *bufferPool) Get() *bytes.Buffer {
 }
 
 func (p *bufferPool) Put(buffer *bytes.Buffer) {
+	buffer.Reset()
 	p.pool.Put(buffer)
 }
 
@@ -116,11 +119,7 @@ func newPipeWriter(bufPool *bufferPool) (*pipeReader, *pipeWriter) {
 		bufPool: bufPool,
 		buf:     nil,
 	}
-	return &pipeReader{
-			pipe: p,
-		}, &pipeWriter{
-			pipe: p,
-		}
+	return &pipeReader{pipe: p}, &pipeWriter{pipe: p}
 }
 
 // Read implements the standard Read interface: it reads data from the pipe,
@@ -216,6 +215,40 @@ type dockerFetcher struct {
 	*dockerBase
 }
 
+func stripSensitiveHeadersForExternalURLs(h http.Header) {
+	h.Del("Authorization")
+	h.Del("Proxy-Authorization")
+	h.Del("Cookie")
+	h.Del("Cookie2")
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func isRegistryOrigin(u *url.URL, hosts []RegistryHost) bool {
+	for _, host := range hosts {
+		if !strings.EqualFold(u.Scheme, host.Scheme) {
+			continue
+		}
+		hostURL := &url.URL{Scheme: host.Scheme, Host: host.Host}
+		if strings.EqualFold(u.Hostname(), hostURL.Hostname()) && effectivePort(u) == effectivePort(hostURL) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("digest", desc.Digest))
 
@@ -227,6 +260,13 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 	ctx, err := ContextWithRepositoryScope(ctx, r.refspec, false)
 	if err != nil {
 		return nil, err
+	}
+
+	if r.warningHandler != nil {
+		ctx = context.WithValue(ctx, warningSourceKey{}, WarningSource{
+			Desc:   &desc,
+			Digest: &desc.Digest,
+		})
 	}
 
 	return newHTTPReadSeeker(desc.Size, func(offset int64) (io.ReadCloser, error) {
@@ -241,6 +281,7 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 				log.G(ctx).Debug("non-http(s) alternative url is unsupported")
 				continue
 			}
+
 			ctx = log.WithLogger(ctx, log.G(ctx).WithField("url", u))
 			log.G(ctx).Info("request")
 
@@ -253,7 +294,9 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 				Capabilities: HostCapabilityPull,
 			}
 			req := r.request(host, http.MethodGet)
-			// Strip namespace from base
+			if !isRegistryOrigin(u, hosts) {
+				stripSensitiveHeadersForExternalURLs(req.header)
+			}
 			req.path = u.Path
 			if u.RawQuery != "" {
 				req.path = req.path + "?" + u.RawQuery
@@ -323,7 +366,6 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 		}
 
 		return nil, firstErr
-
 	})
 }
 
@@ -347,7 +389,7 @@ func (r dockerFetcher) createGetReq(ctx context.Context, host RegistryHost, last
 		headResp.Body.Close()
 	}
 	if headResp.StatusCode > 299 {
-		return nil, 0, fmt.Errorf("unexpected HEAD status code %v: %s", headReq.String(), headResp.Status)
+		return nil, 0, fmt.Errorf("unexpected HEAD status code %v: %s", headReq.sanitizedURL(), headResp.Status)
 	}
 
 	getReq := r.request(host, http.MethodGet, ps...)
@@ -375,6 +417,12 @@ func (r dockerFetcher) FetchByDigest(ctx context.Context, dgst digest.Digest, op
 	ctx, err := ContextWithRepositoryScope(ctx, r.refspec, false)
 	if err != nil {
 		return nil, desc, err
+	}
+
+	if r.warningHandler != nil {
+		ctx = context.WithValue(ctx, warningSourceKey{}, WarningSource{
+			Digest: &dgst,
+		})
 	}
 
 	var (
@@ -510,9 +558,11 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 		if numChunks < parallelism {
 			parallelism = numChunks
 		}
+
+		// Prepare channels, buffer pool, and readers/writers for parallel fetching.
 		queue := make(chan int64, parallelism)
-		ctx, cancelCtx := context.WithCancel(ctx)
-		done := ctx.Done()
+		ctx, cancel := context.WithCancel(ctx)
+		eg, ctx := errgroup.WithContext(ctx)
 		readers, writers := make([]io.Reader, numChunks), make([]*pipeWriter, numChunks)
 		bufPool := newbufferPool(chunkSize)
 		for i := range numChunks {
@@ -520,21 +570,23 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 		}
 		// keep reference of the initial body value to ensure it is closed
 		ibody := body
-		go func() {
+		eg.Go(func() error {
+			defer close(queue)
 			for i := range numChunks {
 				select {
 				case queue <- i:
-				case <-done:
+				case <-ctx.Done():
 					if i == 0 {
 						ibody.Close()
 					}
-					return // avoid leaking a goroutine if we exit early.
+					return ctx.Err()
 				}
 			}
-			close(queue)
-		}()
+			return nil
+		})
+
 		for range parallelism {
-			go func() {
+			eg.Go(func() error {
 				for i := range queue { // first in first out
 					copy := func() error {
 						var body io.ReadCloser
@@ -542,6 +594,7 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 							body = ibody
 						} else {
 							if err := r.Acquire(ctx, 1); err != nil {
+								_ = writers[i].CloseWithError(err)
 								return err
 							}
 							defer r.Release(1)
@@ -550,12 +603,6 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 							nresp, err := reqClone.doWithRetries(ctx, lastHost, withErrorCheck)
 							if err != nil {
 								_ = writers[i].CloseWithError(err)
-								select {
-								case <-done:
-									return ctx.Err()
-								default:
-									cancelCtx()
-								}
 								return err
 							}
 							body = nresp.Body
@@ -564,27 +611,30 @@ func (r dockerFetcher) open(ctx context.Context, req *request, mediatype string,
 						_ = body.Close()
 						_ = writers[i].CloseWithError(err)
 						if err != nil && err != io.EOF {
-							cancelCtx()
 							return err
 						}
 						return nil
 					}
-					if copy() != nil {
-						return
+					if err := copy(); err != nil {
+						return err
 					}
 				}
-			}()
+				return nil
+			})
 		}
 		body = &fnOnClose{
 			BeforeClose: func() {
-				cancelCtx()
+				cancel()
+				if err := eg.Wait(); err != nil {
+					log.G(ctx).WithError(err).Warn("parallel fetch failed")
+				}
 			},
 			ReadCloser: io.NopCloser(io.MultiReader(readers...)),
 		}
 	}
 
-	for i := len(encoding) - 1; i >= 0; i-- {
-		algorithm := strings.ToLower(encoding[i])
+	for _, value := range slices.Backward(encoding) {
+		algorithm := strings.ToLower(value)
 		switch algorithm {
 		case "zstd":
 			r, err := zstd.NewReader(body.ReadCloser,

@@ -78,7 +78,7 @@ func DefaultGCPolicy(cfg GCConfig, dstat disk.DiskStat) []GCPolicy {
 	return []GCPolicy{
 		// if build cache uses more than 512MB delete the most easily reproducible data after it has not been used for 2 days
 		{
-			Filters:      []string{"type==source.local,type==exec.cachemount,type==source.git.checkout"},
+			Filters:      []string{"type==source.local", "type==exec.cachemount", "type==source.git.checkout"},
 			KeepDuration: Duration{Duration: time.Duration(48) * time.Hour}, // 48h
 			MaxUsedSpace: DiskSpace{Bytes: 512 * 1e6},                       // 512MB
 		},
@@ -106,10 +106,7 @@ func DefaultGCPolicy(cfg GCConfig, dstat disk.DiskStat) []GCPolicy {
 }
 
 func stripQuotes(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	if s[0] == '"' && s[len(s)-1] == '"' {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		return s[1 : len(s)-1]
 	}
 	return s

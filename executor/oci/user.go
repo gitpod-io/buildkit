@@ -2,6 +2,7 @@ package oci
 
 import (
 	"context"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -10,10 +11,13 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	containerdoci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
+	"github.com/moby/buildkit/util/openfile"
 	"github.com/moby/sys/user"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 )
+
+const maxUserFileBytes = 10 << 20
 
 func GetUser(root, username string) (uint32, uint32, []uint32, error) {
 	var isDefault bool
@@ -68,12 +72,45 @@ func ParseUIDGID(str string) (uid uint32, gid uint32, err error) {
 	return
 }
 
-func openUserFile(root, p string) (*os.File, error) {
-	p, err := fs.RootPath(root, p)
+func openUserFile(root, orig string) (_ io.ReadCloser, retErr error) {
+	// paths below are daemon-side locations, report the path as the build
+	// asked for it
+	defer func() {
+		var pathErr *os.PathError
+		if errors.As(retErr, &pathErr) {
+			pathErr.Path = orig
+		}
+	}()
+
+	p, err := fs.RootPath(root, orig)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	f, err := openfile.Regular(p)
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(p)
+
+	return &limitedReadCloser{
+		ReadCloser: f,
+		r:          &io.LimitedReader{R: f, N: maxUserFileBytes + 1},
+		name:       orig,
+	}, nil
+}
+
+type limitedReadCloser struct {
+	io.ReadCloser
+	r    *io.LimitedReader
+	name string
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.r.N == 0 {
+		return n, errors.Errorf("%q exceeds %d bytes", l.name, maxUserFileBytes)
+	}
+	return n, err
 }
 
 func parseUID(str string) (uint32, error) {

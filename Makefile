@@ -125,6 +125,6 @@ docs:
 docs-dockerfile:
 	$(BUILDX_CMD) bake docs-dockerfile
 
-.PHONY: mod-outdated
-mod-outdated:
-	$(BUILDX_CMD) bake mod-outdated
+.PHONY: gomod-updates
+gomod-updates:
+	$(BUILDX_CMD) bake gomod-updates

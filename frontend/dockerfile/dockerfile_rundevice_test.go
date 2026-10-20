@@ -1,5 +1,3 @@
-//go:build dfrundevice
-
 package dockerfile
 
 import (
@@ -11,6 +9,7 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/testutil/integration"
+	"github.com/moby/buildkit/util/testutil/workers"
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
 )
@@ -22,6 +21,8 @@ func init() {
 }
 
 func testDeviceRunEnv(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureCDI)
+
 	if sb.Rootless() {
 		t.SkipNow()
 	}

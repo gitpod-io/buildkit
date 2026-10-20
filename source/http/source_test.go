@@ -33,7 +33,7 @@ const signFixturesPathEnv = "BUILDKIT_TEST_SIGN_FIXTURES"
 
 func TestHTTPSource(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	hs, err := newHTTPSource(t)
 	require.NoError(t, err)
@@ -77,7 +77,7 @@ func TestHTTPSource(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dt, []byte("content1"))
 
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 	ref = nil
 
 	// repeat, should use the etag
@@ -105,7 +105,7 @@ func TestHTTPSource(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dt, []byte("content1"))
 
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 	ref = nil
 
 	resp2 := &httpserver.Response{
@@ -144,13 +144,13 @@ func TestHTTPSource(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dt, []byte("content2"))
 
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 	ref = nil
 }
 
 func TestHTTPDefaultName(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	hs, err := newHTTPSource(t)
 	require.NoError(t, err)
@@ -194,13 +194,13 @@ func TestHTTPDefaultName(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, dt, []byte("content1"))
 
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 	ref = nil
 }
 
 func TestHTTPInvalidURL(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	hs, err := newHTTPSource(t)
 	require.NoError(t, err)
@@ -218,9 +218,26 @@ func TestHTTPInvalidURL(t *testing.T) {
 	require.Contains(t, err.Error(), "invalid response")
 }
 
+func TestHTTPCredentialsRedactedInError(t *testing.T) {
+	t.Parallel()
+
+	hs := &httpSourceHandler{
+		src: HTTPIdentifier{
+			URL:      "https://user:s3cr3t@example.com/file",
+			Checksum: digest.FromBytes([]byte("expected")),
+		},
+	}
+
+	err := hs.validatePinnedChecksum(digest.FromBytes([]byte("actual")))
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "s3cr3t")
+	require.NotContains(t, err.Error(), "user:")
+	require.Contains(t, err.Error(), "xxxxx:xxxxx@example.com")
+}
+
 func TestHTTPChecksum(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	hs, err := newHTTPSource(t)
 	require.NoError(t, err)
@@ -294,13 +311,13 @@ func TestHTTPChecksum(t *testing.T) {
 	require.Equal(t, 2, server.Stats("/foo").AllRequests)
 	require.Equal(t, 0, server.Stats("/foo").CachedRequests)
 
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 	ref = nil
 }
 
 func TestHTTPSignatureVerification(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	fixturesPath, ok := os.LookupEnv(signFixturesPathEnv)
 	if !ok {
@@ -385,7 +402,7 @@ func TestHTTPSignatureVerification(t *testing.T) {
 
 func TestPruneAfterCacheKey(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cm, err := newCacheManager(t)
 	require.NoError(t, err)
@@ -440,7 +457,7 @@ func TestPruneAfterCacheKey(t *testing.T) {
 
 	ref, err := h.Snapshot(ctx, jc)
 	require.NoError(t, err)
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 
 	dt, err := readFile(ctx, ref, "foo")
 	require.NoError(t, err)
@@ -597,6 +614,10 @@ func (s *simpleJobContext) Release() error {
 
 func (s *simpleJobContext) ResolverCache() solver.ResolverCache {
 	return nil
+}
+
+func (s *simpleJobContext) CompatibilityVersion() (int, error) {
+	return 0, nil
 }
 
 func readSignFixture(t *testing.T, fixturesPath, name string) []byte {
