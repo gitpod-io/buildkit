@@ -4,18 +4,26 @@ inputs:
   command:
     description: Command to execute, including a Docker build that downloads Go modules.
     required: true
-  attempts:
-    description: Maximum number of attempts, including the first execution.
-    default: "3"
-  delay:
-    description: Seconds to wait between attempts.
-    default: "10"
 runs:
   using: composite
   steps:
     - shell: bash
       env:
         RETRY_COMMAND: ${{ inputs.command }}
-        RETRY_ATTEMPTS: ${{ inputs.attempts }}
-        RETRY_DELAY: ${{ inputs.delay }}
-      run: bash "$GITHUB_ACTION_PATH/retry.sh"
+      run: |
+        log=$(mktemp)
+        trap 'rm -f "$log"' EXIT
+        for attempt in 1 2 3; do
+          echo "Attempt $attempt/3"
+          if bash --noprofile --norc -eo pipefail -c "$RETRY_COMMAND" 2>&1 | tee "$log"; then
+            exit 0
+          else
+            status=${PIPESTATUS[0]}
+          fi
+          if [[ "$status" == 130 || "$status" == 143 ]] || ! grep -Eq 'https?://(proxy\.golang\.org|sum\.golang\.org)/.*(INTERNAL_ERROR|unexpected EOF|i/o timeout|TLS handshake timeout|connection reset by peer|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout)' "$log"; then
+            exit "$status"
+          fi
+          ((attempt < 3)) || exit "$status"
+          echo "::warning::Transient Go download failure; retrying in 10 seconds"
+          sleep 10
+        done
