@@ -18,8 +18,8 @@ ARG AZURITE_VERSION=3.33.0
 ARG GOTESTSUM_VERSION=v1.9.0
 ARG DELVE_VERSION=v1.23.1
 
-ARG GO_VERSION=1.23
-ARG ALPINE_VERSION=3.22
+ARG GO_VERSION=1.26.9
+ARG ALPINE_VERSION=3.23
 ARG XX_VERSION=1.6.1
 ARG BUILDKIT_DEBUG
 ARG EXPORT_BASE=alpine
@@ -140,16 +140,21 @@ RUN --mount=target=/root/.cache,type=cache \
     CGO_ENABLED=0 xx-go build -o /usr/bin/dnsname ./plugins/meta/dnsname && \
     xx-verify --static /usr/bin/dnsname
 
-FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS cni-plugins
-RUN apk add --no-cache curl
-COPY --from=xx / /
+# Rebuild the pinned CNI version with the patched Go toolchain.
+FROM gobuild-base AS cni-plugins
+WORKDIR /go/src/github.com/containernetworking/plugins
 ARG CNI_VERSION
-ARG TARGETOS
-ARG TARGETARCH
+ADD --keep-git-dir=true "https://github.com/containernetworking/plugins.git#$CNI_VERSION" .
 ARG TARGETPLATFORM
-WORKDIR /opt/cni/bin
-RUN curl -Ls https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz | tar xzv
-RUN xx-verify --static bridge loopback host-local
+RUN --mount=target=/root/.cache,type=cache <<EOT
+  set -ex
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/bridge ./plugins/main/bridge
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/loopback ./plugins/main/loopback
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/host-local ./plugins/ipam/host-local
+  CGO_ENABLED=0 xx-go build -mod=vendor -o /opt/cni/bin/firewall ./plugins/meta/firewall
+  cd /opt/cni/bin
+  xx-verify --static bridge loopback host-local firewall
+EOT
 COPY --link --from=dnsname /usr/bin/dnsname /opt/cni/bin/
 
 FROM scratch AS cni-plugins-export
